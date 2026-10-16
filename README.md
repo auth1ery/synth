@@ -13,7 +13,7 @@ Clone the repo, cd into the folder and run:
 
 Alternatively, run
 ```fish
-curl -fsSL https://auth1ery.github.io/synth/install.fish | bash
+curl -fsSL https://auth1ery.github.io/synth/install.fish | fish
 ```
 
 Open a new fish session and run `synth`. Also available:
