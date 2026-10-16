@@ -5,8 +5,15 @@ One Python file, no dependencies (stdlib curses). Needs Python 3.8+, and 3.11+ f
 
 ## Install
 
+Clone the repo, cd into the folder and run:
+
 ```fish
 ./install.fish
+```
+
+Alternatively, run
+```fish
+curl -fsSL https://auth1ery.github.io/synth/install.fish | bash
 ```
 
 Open a new fish session and run `synth`. Also available:
