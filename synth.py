@@ -230,6 +230,13 @@ DEFAULTS = {
     "header_momentum": True,
     "history": True,
     "header_clock": False,
+    "header_left": ["app", "view", "sort", "query", "selection"],
+    "header_right": ["timer", "overdue", "momentum", "habits", "clock", "progress"],
+    "header_style": "plain",
+    "header_text": "",
+    "clock_12h": False,
+    "clock_seconds": False,
+    "header_date": "%a %b %d",
     "clock_format": "%H:%M",
     "header_progress": True,
     "header_info": True,
@@ -272,10 +279,13 @@ STR_OPTS = {
     "detail_tab": ["notes", "info", "links", "history"],
     "note_stamp": None,
     "clock_format": None,
+    "header_style": ["plain", "divided", "pills"],
+    "header_text": None,
+    "header_date": None,
 }
 
 SORTS = ["manual", "priority", "due", "created", "alpha"]  # custom sorts are added from [sorts]
-BOOL_OPTS = ["header_momentum", "history", "snooze_hide", "notes_inline", "header_habits", "header_clock", "header_progress", "header_info",
+BOOL_OPTS = ["clock_12h", "clock_seconds", "header_momentum", "history", "snooze_hide", "notes_inline", "header_habits", "header_clock", "header_progress", "header_info",
              "sidebar_counts", "mouse",
              "sidebar", "ascii", "transparent", "exact_colors", "animations", "show_done", "cascade_done",
              "confirm_delete", "focus_auto", "focus_bell"]
@@ -506,8 +516,14 @@ CONFIG_TEMPLATE = """\
 # header_habits = true       # habits done today
 # header_momentum = true     # streak and weekly trend in the header
 # history = true             # record a per-task timeline of changes
-# header_clock = false       # clock in the header
-# clock_format = "%H:%M"
+# header_left = ["app", "view", "sort", "query", "selection"]   # top bar widgets, left side
+# header_right = ["timer", "overdue", "momentum", "habits", "clock", "progress"]
+#   widgets: app view sort query selection timer progress momentum habits clock date open overdue due_today greeting week text
+# header_style = "plain"     # plain, divided, pills
+# header_text = ""           # shown by the text widget
+# clock_12h = false          # 3:07 PM instead of 15:07
+# clock_seconds = false
+# clock_format = "%H:%M"     # anything else overrides clock_12h and clock_seconds
 # sidebar_counts = true
 # sidebar_sections = ["custom", "projects", "tags"]   # order and visibility
 # sidebar_builtin = ["all", "today", "upcoming", "inbox", "done", "ready", "blocked", "snoozed"]
@@ -1995,6 +2011,8 @@ HOOK_EVENTS = {
 }
 STRING_KEYS = {"app_name": "Name shown in the header.", "empty": "Text for an empty list.",
                "add_title": "Title of the add task prompt."}
+HEADER_WIDGETS = ["app", "view", "sort", "query", "selection", "timer", "progress", "momentum", "habits", "clock",
+                  "date", "open", "overdue", "due_today", "greeting", "week", "text"]
 COLUMN_CHOICES = ["check", "prio", "id", "title", "est", "tags", "project", "time", "due", "deps", "snooze", "created"]
 SCREEN_CHOICES = ["list", "journal", "habits", "projects", "stats", "calendar", "agenda"]
 ROLE_DOC = {
@@ -2087,12 +2105,17 @@ def build_settings_tree():
         _s("detail_tab", "Default Tab", "choice", "Tab that opens first.", choices=["notes", "info", "links", "history"]),
     ]
     header = [
-        _s("header_info", "Header Sort Info", "bool", "Show the sort and hide-done text in the header."),
-        _s("header_progress", "Header Progress Bar", "bool", "Show done over total as a bar."),
-        _s("header_habits", "Header Habits", "bool", "Show habits done today."),
-        _s("header_momentum", "Header Momentum", "bool", "Show the completion streak and weekly trend."),
-        _s("header_clock", "Header Clock", "bool", "Show a clock in the header."),
-        _s("clock_format", "Clock Format", "text", "strftime format for the clock."),
+        _s("header_left", "Top Bar, Left Widgets", "order", "Widgets on the left of the top bar, in order. Widgets that do not fit are skipped.",
+           available=HEADER_WIDGETS, required=[]),
+        _s("header_right", "Top Bar, Right Widgets", "order", "Widgets on the right of the top bar, in order.",
+           available=HEADER_WIDGETS, required=[]),
+        _s("header_style", "Top Bar Style", "choice", "plain, divided (separator lines) or pills (each widget on its own background).",
+           choices=["plain", "divided", "pills"]),
+        _s("clock_12h", "12 Hour Clock", "bool", "Show the clock as 3:07 PM instead of 15:07."),
+        _s("clock_seconds", "Clock Seconds", "bool", "Include seconds in the clock."),
+        _s("clock_format", "Custom Clock Format", "text", "strftime format. Anything other than %H:%M overrides the two options above."),
+        _s("header_date", "Top Bar Date Format", "text", "strftime format for the date widget."),
+        _s("header_text", "Custom Text", "text", "Text for the text widget, for example a motto or your name."),
         _s("hints", "Footer Hints", "strlist", "Actions shown in the footer, for example add:new, toggle:done. Empty uses the default set."),
         _s("strings", "Wording", "records", "Rename pieces of the interface.", dict=True, vlabel="Text", vkind="text",
            names=list(STRING_KEYS)),
@@ -3441,6 +3464,149 @@ class App:
             return cols[p]
         return {0: "dim", 1: "p1", 2: "p2", 3: "p3"}[p]
 
+    def clock_text(self):
+        o = self.opts
+        fmt = o.get("clock_format") or "%H:%M"
+        now = dt.datetime.now()
+        if fmt != "%H:%M":
+            return now.strftime(fmt)
+        if o.get("clock_12h"):
+            txt = now.strftime("%I:%M:%S %p" if o.get("clock_seconds") else "%I:%M %p")
+            return txt.lstrip("0")
+        return now.strftime("%H:%M:%S" if o.get("clock_seconds") else "%H:%M")
+
+    def header_lists(self):
+        o = self.opts
+        left = [w for w in (o.get("header_left") or []) if w in HEADER_WIDGETS]
+        right = [w for w in (o.get("header_right") or []) if w in HEADER_WIDGETS]
+        # legacy switches from older config files
+        if not o.get("header_info", True):
+            left = [w for w in left if w != "sort"]
+        for key, name in (("header_progress", "progress"), ("header_habits", "habits"), ("header_momentum", "momentum")):
+            if not o.get(key, True):
+                right = [w for w in right if w != name]
+        if o.get("header_clock") and "clock" not in left + right:
+            right.append("clock")
+        return left, right
+
+    def header_widget(self, name):
+        """Return (text, role, bold) for one top bar widget, or None to hide it."""
+        o, s = self.opts, self.sym
+        td = today()
+        if name == "app":
+            return self.s("app_name", "synth."), "accent", True
+        if name == "view":
+            return self.view_label(self.view), "accent2", True
+        if name == "sort":
+            info = "sort:" + self.view_opt("sort")
+            if not self.view_opt("show_done"):
+                info += "  hide-done"
+            return info, "dim", False
+        if name == "query":
+            return ("/" + self.query, "today", True) if self.query else None
+        if name == "selection":
+            return ("%d selected" % len(self.selected), "accent2", True) if self.selected else None
+        if name == "timer":
+            act = self.store.active
+            if not act:
+                return None
+            tt = self.store.get(act["id"])
+            frames = SPINNER_ASCII if o["ascii"] else SPINNER
+            spin = frames[int(time.time() * 5) % 4] if o.get("animations") else s["track"]
+            return "%s %s %s" % (spin, fmt_duration(self.active_elapsed(), True), clip(tt["title"] if tt else "?", 24)), "today", True
+        if name == "progress":
+            total, done = self.keep_count, self.keep_done
+            if not total:
+                return None
+            filled = int(round(10 * self.bar_disp))
+            return "%s %d/%d" % (s["bar_on"] * filled + s["bar_off"] * (10 - filled), done, total), "ok", False
+        if name == "momentum":
+            mi = self.momentum()
+            if not (mi["streak"] or mi["last7"]):
+                return None
+            arrow = {1: s["up"], -1: s["down"], 0: s["flat"]}[mi["trend"]]
+            txt = "%dd %s %d" % (mi["streak"], arrow, mi["last7"]) if mi["streak"] else "%s %d" % (arrow, mi["last7"])
+            return txt, "ok" if mi["trend"] >= 0 else "today", False
+        if name == "habits":
+            if not self.store.habits:
+                return None
+            hd, ht = habit_summary(self.store, td)
+            return ("habits %d/%d" % (hd, ht), "ok" if hd == ht else "accent2", False) if ht else None
+        if name == "clock":
+            return self.clock_text(), "dim", False
+        if name == "date":
+            return td.strftime(o.get("header_date") or "%a %b %d"), "dim", False
+        if name in ("open", "overdue", "due_today"):
+            iso = td.isoformat()
+            live = [t for t in self.store.tasks if not t["done"]]
+            if name == "open":
+                return "%d open" % len(live), "fg", False
+            if name == "overdue":
+                n = sum(1 for t in live if t["due"] and t["due"] < iso)
+                return ("%d overdue" % n, "overdue", True) if n else None
+            n = sum(1 for t in live if t["due"] == iso)
+            return ("%d today" % n, "today", False) if n else None
+        if name == "greeting":
+            h = dt.datetime.now().hour
+            return "good " + ("morning" if h < 12 else "afternoon" if h < 18 else "evening"), "accent2", False
+        if name == "week":
+            return "week %d" % td.isocalendar()[1], "dim", False
+        if name == "text":
+            return (o.get("header_text") or None) and (o["header_text"], "accent2", False)
+        return None
+
+    def draw_header(self, W):
+        left, right = self.header_lists()
+        style = self.opts.get("header_style", "plain")
+        sep_ch = self.sym["vline"]
+
+        def build(names):
+            out = []
+            for n in names:
+                w = self.header_widget(n)
+                if w and w[0]:
+                    out.append(w)
+            return out
+
+        def paint(x, w, first):
+            text, role, bold = w
+            if style == "pills":
+                seg = " %s " % text
+                self.put(0, x, seg, self.attr(role, "sel_bg", bold=bold))
+                return x + cell_len(seg) + 1
+            if style == "divided" and not first:
+                self.put(0, x, sep_ch, self.attr("border", "bar_bg"))
+                x += 1
+            seg = " %s " % text
+            self.put(0, x, seg, self.attr(role, "bar_bg", bold=bold))
+            return x + cell_len(seg) + (0 if style == "divided" else 0)
+
+        def width_of(w, first):
+            extra = 1 if (style == "pills" or (style == "divided" and not first)) else 0
+            return cell_len(w[0]) + 2 + extra
+
+        x, first = 0, True
+        lw = build(left)
+        for w in lw:
+            if x + width_of(w, first) > W - 2:
+                continue
+            x = paint(x, w, first)
+            first = False
+        rw = build(right)
+        fit, used = [], 0
+        for w in reversed(rw):
+            need = width_of(w, False) + (1 if style == "plain" else 0)
+            if x + used + need + 2 > W:
+                continue
+            fit.append(w)
+            used += need
+        fit.reverse()
+        rx = W - used
+        first = True
+        for w in fit:
+            rx = paint(rx, w, first)
+            first = False
+
     def draw(self):
         scr = self.scr
         scr.erase()
@@ -3467,15 +3633,6 @@ class App:
         # header
         hb = self.attr("fg", "bar_bg")
         self.fill(0, 0, W, hb)
-        x = self.put(0, 1, self.s("app_name", "synth."), self.attr("accent", "bar_bg", bold=True))
-        x = self.put(0, x + 1, self.view_label(self.view), self.attr("accent2", "bar_bg", bold=True))
-        info = "  sort:" + self.view_opt("sort")
-        if not self.view_opt("show_done"):
-            info += "  hide-done"
-        if o.get("header_info", True):
-            x = self.put(0, x, info, self.attr("dim", "bar_bg"))
-        if self.query:
-            x = self.put(0, x + 2, "/" + self.query, self.attr("today", "bar_bg", bold=True))
         total, done = self.keep_count, self.keep_done
         target = (done / float(total)) if total else 0.0
         if o.get("animations"):
@@ -3485,41 +3642,7 @@ class App:
             self.bar_busy = abs(target - self.bar_disp) > 0.0
         else:
             self.bar_disp, self.bar_busy = target, False
-        right_x = W - 1
-        if total and o.get("header_progress", True):
-            bw = 10
-            filled = int(round(bw * self.bar_disp))
-            bar = s["bar_on"] * filled + s["bar_off"] * (bw - filled)
-            right = " %s %d/%d " % (bar, done, total)
-            right_x = W - cell_len(right) - 1
-            self.put(0, right_x, right, self.attr("ok", "bar_bg"))
-        if o.get("header_momentum", True):
-            mi = self.momentum()
-            if mi["streak"] or mi["last7"]:
-                arrow = {1: s["up"], -1: s["down"], 0: s["flat"]}[mi["trend"]]
-                seg = " %dd %s %d " % (mi["streak"], arrow, mi["last7"]) if mi["streak"] else " %s %d " % (arrow, mi["last7"])
-                if right_x - cell_len(seg) - 1 > x + 4:
-                    right_x = right_x - cell_len(seg) - 1
-                    self.put(0, right_x, seg, self.attr("ok" if mi["trend"] >= 0 else "today", "bar_bg"))
-        if o.get("header_habits", True) and self.store.habits:
-            hd, ht = habit_summary(self.store, today())
-            if ht:
-                seg = " habits %d/%d " % (hd, ht)
-                if right_x - cell_len(seg) - 1 > x + 4:
-                    right_x = right_x - cell_len(seg) - 1
-                    self.put(0, right_x, seg, self.attr("ok" if hd == ht else "accent2", "bar_bg"))
-        if o.get("header_clock"):
-            seg = " %s " % dt.datetime.now().strftime(o.get("clock_format", "%H:%M"))
-            if right_x - cell_len(seg) - 1 > x + 4:
-                right_x = right_x - cell_len(seg) - 1
-                self.put(0, right_x, seg, self.attr("dim", "bar_bg"))
-        act = self.store.active
-        if act:
-            tt = self.store.get(act["id"])
-            frames = SPINNER_ASCII if o["ascii"] else SPINNER
-            spin = frames[int(time.time() * 5) % 4] if o.get("animations") else s["track"]
-            seg = " %s %s %s " % (spin, fmt_duration(self.active_elapsed(), True), clip(tt["title"] if tt else "?", 24))
-            self.put(0, max(2, right_x - cell_len(seg) - 1), seg, self.attr("today", "bar_bg", bold=True))
+        self.draw_header(W)
 
         # sidebar
         if sw:

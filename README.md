@@ -220,6 +220,13 @@ The layout is a category tree on the left and a card per setting on the right, e
 Changes are saved to `settings.json` next to your config and take priority over `config.toml`, which keeps working for hand editing.
 With `--profile NAME` the file is `settings-NAME.json`.
 
+### Top bar widgets
+The top bar is built from widgets you order yourself (settings panel, Header category): `header_left` and `header_right`.
+Widgets: `app`, `view`, `sort`, `query`, `selection`, `timer`, `progress`, `momentum`, `habits`, `clock`, `date`, `open`,
+`overdue`, `due_today`, `greeting`, `week` and `text` (your own text from `header_text`). Widgets that have nothing to show
+hide themselves, and ones that do not fit are skipped. `header_style` is `plain`, `divided` or `pills`.
+For the clock, `clock_12h` gives `3:07 PM` and `clock_seconds` adds seconds. `clock_format` (strftime) overrides both.
+
 ## Customizing in a file
 
 Almost everything is configurable, see the template for the full list. Highlights beyond keys, themes and views:
