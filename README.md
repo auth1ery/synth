@@ -95,9 +95,9 @@ Custom views in the sidebar use the same syntax.
 | `D` | daily journal | `Y` | habit tracker |
 | `O` | projects and goals | `B` | dependencies |
 | `Z` | snooze | `N` | new from template |
-| `=` | custom actions and templates | `I` | switch detail tab (notes, info, links) |
+| `=` | custom actions and templates | `I` | switch detail tab (notes, info, links, history) |
 | `y` | copy task text | `alt-y` | duplicate task with subtasks |
-| `,` | settings panel | | |
+| `,` | settings panel | `W` | what changed (timeline of edits) |
 
 Bulk actions (done, delete, priority, due, tags, project, repeat) apply to all selected tasks.
 Mouse: click selects, click the checkbox toggles, double click edits, wheel scrolls, click a view in the sidebar.
@@ -169,9 +169,17 @@ against an estimate (the detail pane turns red when you go over). `synth --track
 prompts and status bars.
 
 ### Stats (`S`)
-Four pages (`tab` or `1 2 3 4`, `r` changes the range between 7, 14 and 30 days):
+Five pages (`tab` or `1`-`5`, `r` changes the range between 7, 14 and 30 days):
 overview (done today, streak, per day average, open and overdue, completions per day, open by priority),
-time (tracked per day, by project, top tasks), a 26 week completion heatmap with a weekday breakdown, and estimate accuracy.
+time (tracked per day, by project, top tasks), a 26 week completion heatmap with a weekday breakdown, estimate accuracy, and momentum (current and best streak, last 7 days against the 7 before, weekly bars).
+The header shows a compact `5d ▲ 12` segment: your completion streak, the trend arrow and tasks done in the last 7 days
+(turn it off with `header_momentum = false`).
+
+### Task history (`I` to the history tab, `W` for everything)
+Every change to a task (created, completed, reopened, renamed, priority, due date, project, tags, snooze, dependencies,
+notes, estimate, repeat) is recorded with a timestamp. The `history` tab of the detail pane shows one task's timeline,
+and `W` (or `:changes`) lists everything that changed in the last day, 7, 14 or 30 days (`r` switches the range).
+Undo also rolls the history back. Turn recording off with `history = false`.
 
 ### Calendar and agenda (`C`)
 A month grid with a dot per open task (colored by priority, red when overdue) and a day panel.

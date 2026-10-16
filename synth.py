@@ -113,6 +113,7 @@ DEFAULT_KEYS = {
     "detail_down": ["ctrl-e"],
     "detail_up": ["ctrl-y"],
     "detail_tab": ["I"],
+    "changes": ["W"],
     "duplicate": ["alt-y"],
     "yank": ["y"],
     "settings": [","],
@@ -175,6 +176,7 @@ ACTION_DOC = {
     "snooze": "snooze task until a date",
     "journal": "daily journal",
     "habits": "habit tracker",
+    "changes": "what changed (timeline of edits)",
     "projects": "projects and goals",
     "template": "new task from a template",
     "actions_menu": "custom actions and templates",
@@ -225,6 +227,8 @@ DEFAULTS = {
     "snooze_hide": True,
     "blocked_done": "warn",
     "header_habits": True,
+    "header_momentum": True,
+    "history": True,
     "header_clock": False,
     "clock_format": "%H:%M",
     "header_progress": True,
@@ -250,7 +254,7 @@ DEFAULTS = {
     "hints": [],
     "include": [],
     "detail_tab": "notes",
-    "detail_sections": ["notes", "info", "links"],
+    "detail_sections": ["notes", "info", "links", "history"],
 }
 
 BORDERS = {
@@ -265,13 +269,13 @@ STR_OPTS = {
     "border_style": list(BORDERS),
     "blocked_done": ["warn", "allow", "deny"],
     "start_screen": ["list", "journal", "habits", "projects", "stats", "calendar", "agenda"],
-    "detail_tab": ["notes", "info", "links"],
+    "detail_tab": ["notes", "info", "links", "history"],
     "note_stamp": None,
     "clock_format": None,
 }
 
 SORTS = ["manual", "priority", "due", "created", "alpha"]  # custom sorts are added from [sorts]
-BOOL_OPTS = ["snooze_hide", "notes_inline", "header_habits", "header_clock", "header_progress", "header_info",
+BOOL_OPTS = ["header_momentum", "history", "snooze_hide", "notes_inline", "header_habits", "header_clock", "header_progress", "header_info",
              "sidebar_counts", "mouse",
              "sidebar", "ascii", "transparent", "exact_colors", "animations", "show_done", "cascade_done",
              "confirm_delete", "focus_auto", "focus_bell"]
@@ -304,6 +308,9 @@ UNICODE_SYMBOLS = {
     "blocked": "⊘",
     "snooze": "◌",
     "wake": "▲",
+    "up": "▲",
+    "down": "▼",
+    "flat": "▬",
 }
 
 ASCII_SYMBOLS = {
@@ -332,6 +339,9 @@ ASCII_SYMBOLS = {
     "blocked": "X",
     "snooze": "z",
     "wake": "^",
+    "up": "+",
+    "down": "-",
+    "flat": "=",
 }
 
 THEME_ROLES = [
@@ -476,7 +486,7 @@ CONFIG_TEMPLATE = """\
 # inherit = "nord"           # start from another theme instead of tokyonight
 
 # ---- notes, journal, habits, snooze, dependencies ----
-# detail_sections = ["notes", "info", "links"]   # tabs of the detail pane, press I to cycle
+# detail_sections = ["notes", "info", "links", "history"]   # tabs of the detail pane, press I to cycle
 # detail_tab = "notes"       # tab to open with
 # notes_editor = "builtin"   # builtin (ctrl-s saves) or external ($VISUAL / $EDITOR)
 # note_stamp = "%Y-%m-%d %H:%M"   # stamp used by the quick note key
@@ -494,6 +504,8 @@ CONFIG_TEMPLATE = """\
 # header_info = true         # sort and hide-done text in the header
 # header_progress = true     # progress bar
 # header_habits = true       # habits done today
+# header_momentum = true     # streak and weekly trend in the header
+# history = true             # record a per-task timeline of changes
 # header_clock = false       # clock in the header
 # clock_format = "%H:%M"
 # sidebar_counts = true
@@ -879,6 +891,7 @@ class Store:
         self.projects = {}
         self.journal = {}
         self.goals = []
+        self.history = []
         self.load()
 
     def load(self):
@@ -902,6 +915,7 @@ class Store:
         self.projects = data.get("projects", {})
         self.journal = data.get("journal", {})
         self.goals = data.get("goals", [])
+        self.history = [e for e in data.get("history", []) if isinstance(e, dict) and "id" in e and "t" in e and "k" in e]
 
     def save(self):
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
@@ -910,7 +924,8 @@ class Store:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump({"version": 2, "next_id": self.next_id, "tasks": self.tasks, "done_log": self.done_log,
                            "time_log": self.time_log, "active": self.active, "habits": self.habits,
-                           "projects": self.projects, "journal": self.journal, "goals": self.goals}, fh, indent=1, ensure_ascii=False)
+                           "projects": self.projects, "journal": self.journal, "goals": self.goals,
+                           "history": self.history}, fh, indent=1, ensure_ascii=False)
             os.replace(tmp, self.path)
             self.mtime = os.path.getmtime(self.path)
         except OSError:
@@ -932,27 +947,43 @@ class Store:
         self._map = None
 
     def snap(self):
-        self.undo_stack.append((copy.deepcopy(self.tasks), self.next_id, copy.deepcopy(self.done_log), copy.deepcopy((self.habits, self.projects, self.journal, self.goals))))
+        self.undo_stack.append((copy.deepcopy(self.tasks), self.next_id, copy.deepcopy(self.done_log), copy.deepcopy((self.habits, self.projects, self.journal, self.goals, self.history))))
         del self.undo_stack[:-200]
         self.redo_stack.clear()
 
     def undo(self):
         if not self.undo_stack:
             return False
-        self.redo_stack.append((copy.deepcopy(self.tasks), self.next_id, copy.deepcopy(self.done_log), copy.deepcopy((self.habits, self.projects, self.journal, self.goals))))
+        self.redo_stack.append((copy.deepcopy(self.tasks), self.next_id, copy.deepcopy(self.done_log), copy.deepcopy((self.habits, self.projects, self.journal, self.goals, self.history))))
         self.tasks, self.next_id, self.done_log, ex = self.undo_stack.pop()
-        self.habits, self.projects, self.journal, self.goals = ex
+        self.habits, self.projects, self.journal, self.goals, self.history = ex
         self.invalidate()
         return True
 
     def redo(self):
         if not self.redo_stack:
             return False
-        self.undo_stack.append((copy.deepcopy(self.tasks), self.next_id, copy.deepcopy(self.done_log), copy.deepcopy((self.habits, self.projects, self.journal, self.goals))))
+        self.undo_stack.append((copy.deepcopy(self.tasks), self.next_id, copy.deepcopy(self.done_log), copy.deepcopy((self.habits, self.projects, self.journal, self.goals, self.history))))
         self.tasks, self.next_id, self.done_log, ex = self.redo_stack.pop()
-        self.habits, self.projects, self.journal, self.goals = ex
+        self.habits, self.projects, self.journal, self.goals, self.history = ex
         self.invalidate()
         return True
+
+    def record_changes(self, before):
+        """Append history events by comparing task signatures taken before an edit."""
+        stamp = now_iso()
+        live = set()
+        for t in self.tasks:
+            live.add(t["id"])
+            old = before.get(t["id"])
+            if old is None:
+                self.history.append({"t": stamp, "id": t["id"], "k": "created", "d": t["title"]})
+                continue
+            for k, d in diff_sig(old, t):
+                self.history.append({"t": stamp, "id": t["id"], "k": k, "d": d})
+        if any(i not in live for i in before):
+            self.history = [e for e in self.history if e["id"] in live]
+        del self.history[:-HISTORY_CAP]
 
     def children(self, tid):
         return [t for t in self.tasks if t["parent"] == tid]
@@ -1286,6 +1317,91 @@ def streak_info(iso_days, td):
         cur += 1
         d -= dt.timedelta(days=1)
     return cur, best
+
+
+HISTORY_CAP = 6000
+
+
+def task_sig(t):
+    return {"title": t["title"], "done": bool(t["done"]), "prio": t["prio"], "due": t["due"],
+            "project": t["project"], "tags": list(t["tags"]), "snooze": t.get("snooze", ""),
+            "deps": list(t.get("deps", [])), "notes": t["notes"], "est": t.get("est", 0),
+            "repeat": t["repeat"]}
+
+
+def diff_sig(old, t):
+    """Return a list of (kind, detail) describing how task t differs from old."""
+    new = task_sig(t)
+    out = []
+    if old["done"] != new["done"]:
+        out.append(("done" if new["done"] else "reopen", ""))
+    if old["title"] != new["title"]:
+        out.append(("title", "%s -> %s" % (old["title"], new["title"])))
+    if old["prio"] != new["prio"]:
+        out.append(("prio", "%d -> %d" % (old["prio"], new["prio"])))
+    if old["due"] != new["due"]:
+        out.append(("due", "%s -> %s" % (old["due"] or "none", new["due"] or "none")))
+    if old["project"] != new["project"]:
+        out.append(("project", "%s -> %s" % (old["project"] or "none", new["project"] or "none")))
+    if old["tags"] != new["tags"]:
+        add = [g for g in new["tags"] if g not in old["tags"]]
+        rem = [g for g in old["tags"] if g not in new["tags"]]
+        out.append(("tags", " ".join(["+#" + g for g in add] + ["-#" + g for g in rem])))
+    if old["snooze"] != new["snooze"]:
+        out.append(("snooze", ("until " + new["snooze"]) if new["snooze"] else "cleared"))
+    if old["deps"] != new["deps"]:
+        add = [d for d in new["deps"] if d not in old["deps"]]
+        rem = [d for d in old["deps"] if d not in new["deps"]]
+        out.append(("deps", " ".join(["+#%d" % d for d in add] + ["-#%d" % d for d in rem])))
+    if old["notes"] != new["notes"]:
+        if not old["notes"].strip():
+            out.append(("notes", "notes added"))
+        elif not new["notes"].strip():
+            out.append(("notes", "notes cleared"))
+        else:
+            delta = len(new["notes"]) - len(old["notes"])
+            out.append(("notes", "notes edited (%+d chars)" % delta))
+    if old["est"] != new["est"]:
+        out.append(("est", "%s -> %s" % (fmt_duration(old["est"]) if old["est"] else "none",
+                                         fmt_duration(new["est"]) if new["est"] else "none")))
+    if old["repeat"] != new["repeat"]:
+        out.append(("repeat", new["repeat"] or "cleared"))
+    return out
+
+
+HIST_LABEL = {"created": "created", "done": "completed", "reopen": "reopened", "title": "renamed",
+              "prio": "priority", "due": "due date", "project": "project", "tags": "tags",
+              "snooze": "snoozed", "deps": "dependencies", "notes": "notes", "est": "estimate",
+              "repeat": "repeat"}
+
+
+def history_for(store, tid):
+    """Timeline for one task: a synthetic created entry when none was recorded, then events."""
+    ev = [e for e in store.history if e["id"] == tid]
+    t = store.get(tid)
+    if t and not any(e["k"] == "created" for e in ev):
+        ev.insert(0, {"t": t["created"], "id": tid, "k": "created", "d": ""})
+    ev.sort(key=lambda e: e["t"])
+    return ev
+
+
+def momentum_info(iso_days, td, weeks=8):
+    """Streak, rolling 7 day trend against the 7 days before, and weekly totals.
+
+    iso_days is an iterable with one iso date per completed task.
+    """
+    c = collections.Counter(iso_days)
+    cur, best = streak_info(c.keys(), td) if c else (0, 0)
+    last = sum(c.get((td - dt.timedelta(days=i)).isoformat(), 0) for i in range(7))
+    prev = sum(c.get((td - dt.timedelta(days=i)).isoformat(), 0) for i in range(7, 14))
+    if last == prev:
+        trend = 0
+    else:
+        trend = 1 if last > prev else -1
+    wk = []
+    for w in range(weeks - 1, -1, -1):
+        wk.append(sum(c.get((td - dt.timedelta(days=w * 7 + i)).isoformat(), 0) for i in range(7)))
+    return {"streak": cur, "best": best, "last7": last, "prev7": prev, "trend": trend, "weeks": wk}
 
 
 BIG_DIGITS = {
@@ -1966,14 +2082,15 @@ def build_settings_tree():
     detail = [
         _s("detail", "Detail Pane", "choice", "Where the task detail pane sits.", choices=["right", "bottom", "off"]),
         _s("detail_size", "Detail Pane Size", "int", "Width when on the right, height when at the bottom.", min=8, max=90),
-        _s("detail_sections", "Detail Tabs", "order", "Tabs of the detail pane, in order.", available=["notes", "info", "links"],
+        _s("detail_sections", "Detail Tabs", "order", "Tabs of the detail pane, in order.", available=["notes", "info", "links", "history"],
            required=["notes"]),
-        _s("detail_tab", "Default Tab", "choice", "Tab that opens first.", choices=["notes", "info", "links"]),
+        _s("detail_tab", "Default Tab", "choice", "Tab that opens first.", choices=["notes", "info", "links", "history"]),
     ]
     header = [
         _s("header_info", "Header Sort Info", "bool", "Show the sort and hide-done text in the header."),
         _s("header_progress", "Header Progress Bar", "bool", "Show done over total as a bar."),
         _s("header_habits", "Header Habits", "bool", "Show habits done today."),
+        _s("header_momentum", "Header Momentum", "bool", "Show the completion streak and weekly trend."),
         _s("header_clock", "Header Clock", "bool", "Show a clock in the header."),
         _s("clock_format", "Clock Format", "text", "strftime format for the clock."),
         _s("hints", "Footer Hints", "strlist", "Actions shown in the footer, for example add:new, toggle:done. Empty uses the default set."),
@@ -2462,8 +2579,11 @@ class App:
     @contextlib.contextmanager
     def edit(self):
         self.store.snap()
+        before = {t["id"]: task_sig(t) for t in self.store.tasks} if self.opts.get("history", True) else None
         yield
         self.store.invalidate()
+        if before is not None:
+            self.store.record_changes(before)
         self.store.save()
 
     def hook(self, event, task):
@@ -2802,7 +2922,7 @@ class App:
     # ----- palette -----
 
     COMMANDS = ["settings", "journal", "habits", "projects", "goals", "note", "snooze", "deps", "template", "run", "theme", "sort", "view", "filter", "set", "export", "clear", "reload", "config",
-                "add", "stats", "calendar", "agenda", "focus", "track", "find", "links", "help", "quit", "w", "q"]
+                "add", "stats", "changes", "calendar", "agenda", "focus", "track", "find", "links", "help", "quit", "w", "q"]
 
     def act_palette(self):
         text = self.prompt(":", "", complete=self.COMMANDS, hist="cmd")
@@ -2859,6 +2979,8 @@ class App:
             self.open_in_editor(self.cfg_path)
         elif cmd == "stats":
             self.act_stats()
+        elif cmd in ("changes", "history"):
+            self.act_changes()
         elif cmd == "calendar":
             self.act_calendar()
         elif cmd == "agenda":
@@ -3266,7 +3388,7 @@ class App:
             ("NOTES, LINKS, PLANNING", ["notes", "note_add", "links", "link_add", "deps", "snooze", "template",
                                         "actions_menu"]),
             ("FILTER AND SORT", ["search", "clear_filter", "sort", "hide_done"]),
-            ("SCREENS AND TOOLS", ["journal", "habits", "projects", "calendar", "stats", "focus_mode", "track",
+            ("SCREENS AND TOOLS", ["journal", "habits", "projects", "calendar", "stats", "changes", "focus_mode", "track",
                                    "theme", "settings", "palette", "help", "quit"]),
         ]
         seen = set()
@@ -3371,6 +3493,14 @@ class App:
             right = " %s %d/%d " % (bar, done, total)
             right_x = W - cell_len(right) - 1
             self.put(0, right_x, right, self.attr("ok", "bar_bg"))
+        if o.get("header_momentum", True):
+            mi = self.momentum()
+            if mi["streak"] or mi["last7"]:
+                arrow = {1: s["up"], -1: s["down"], 0: s["flat"]}[mi["trend"]]
+                seg = " %dd %s %d " % (mi["streak"], arrow, mi["last7"]) if mi["streak"] else " %s %d " % (arrow, mi["last7"])
+                if right_x - cell_len(seg) - 1 > x + 4:
+                    right_x = right_x - cell_len(seg) - 1
+                    self.put(0, right_x, seg, self.attr("ok" if mi["trend"] >= 0 else "today", "bar_bg"))
         if o.get("header_habits", True) and self.store.habits:
             hd, ht = habit_summary(self.store, today())
             if ht:
@@ -3646,7 +3776,7 @@ class App:
                 self.sweep(row_y, x, w, sp)
 
     def detail_tab_names(self):
-        names = [n for n in self.opts.get("detail_sections", []) if n in ("notes", "info", "links")]
+        names = [n for n in self.opts.get("detail_sections", []) if n in ("notes", "info", "links", "history")]
         return names or ["notes", "info", "links"]
 
     def act_detail_tab(self, step=1, name=None):
@@ -3712,6 +3842,22 @@ class App:
             row("created", t["created"].replace("T", " ")[:16], "dim")
             if t["done_at"]:
                 row("finished", t["done_at"].replace("T", " ")[:16], "dim")
+        elif tab == "history":
+            evs = history_for(self.store, t["id"])
+            if not evs:
+                lines.append(("No history yet.", "dim", False))
+            last_day = ""
+            for e in reversed(evs):
+                day = e["t"][:10]
+                if day != last_day:
+                    head(day)
+                    last_day = day
+                txt = "%s %s" % (e["t"][11:16], HIST_LABEL.get(e["k"], e["k"]))
+                if e["d"] and e["k"] != "created":
+                    txt += "  " + e["d"]
+                role = "ok" if e["k"] == "done" else "fg"
+                for i, ln in enumerate(wrap(txt, w - 2) or [""]):
+                    lines.append((("%s " % self.sym["bullet"] if i == 0 else "  ") + ln, role, False))
         else:
             wo = waiting_on(self.store, t)
             if t.get("deps") or wo:
@@ -4210,7 +4356,7 @@ class App:
 
     def act_stats(self):
         ranges = [7, 14, 30]
-        tabs = ["overview", "time", "heatmap", "estimates"]
+        tabs = ["overview", "time", "heatmap", "estimates", "momentum"]
         S = {"ri": 1, "tab": 0, "t0": time.time()}
 
         def render():
@@ -4242,7 +4388,7 @@ class App:
                 elif name in ("shift-tab", "h", "left"):
                     S["tab"] = (S["tab"] - 1) % len(tabs)
                     S["t0"] = time.time()
-                elif name in ("1", "2", "3", "4"):
+                elif name in ("1", "2", "3", "4", "5"):
                     S["tab"] = int(name) - 1
                     S["t0"] = time.time()
                 elif name == "r":
@@ -4263,7 +4409,7 @@ class App:
             x = self.put(0, x, " %d %s " % (i + 1, name), self.attr("accent" if on else "dim", "sel_bg" if on else "bar_bg", bold=on)) + 1
         self.put(0, W - 16, "last %d days " % days, self.attr("dim", "bar_bg"))
         self.fill(H - 1, 0, W, self.attr("fg", "bar_bg"))
-        self.put(H - 1, 1, "tab or h/l switch   1 2 3 4 jump   r range   q close", self.attr("dim", "bar_bg"), W - 2)
+        self.put(H - 1, 1, "tab or h/l switch   1-5 jump   r range   q close", self.attr("dim", "bar_bg"), W - 2)
         td = today()
         labels = [str(x.day) for x in d["dates"]]
         if tab == 0:
@@ -4322,6 +4468,8 @@ class App:
                 self.hbars(by + 1, 2 + half, half - 2, rows, "tag", grow)
         elif tab == 3:
             self.draw_estimates(H, W, days, grow)
+        elif tab == 4:
+            self.draw_momentum(H, W, grow)
         else:
             weeks = max(8, min(26, (W - 10) // 2))
             start = td - dt.timedelta(days=td.weekday()) - dt.timedelta(weeks=weeks - 1)
@@ -6125,6 +6273,95 @@ class App:
 
     # ----- estimate accuracy page -----
 
+    def momentum(self):
+        key = (len(self.store.done_log), today().isoformat())
+        if getattr(self, "_mom_key", None) != key:
+            self._mom_key = key
+            self._mom = momentum_info([e["t"][:10] for e in self.store.done_log], today())
+        return self._mom
+
+    def draw_momentum(self, H, W, grow):
+        m = momentum_info([e["t"][:10] for e in self.store.done_log], today(), 12)
+        s = self.sym
+        word = {1: "picking up", -1: "slowing down", 0: "steady"}[m["trend"]]
+        self.tiles(2, [
+            (str(m["streak"]), "day streak", "ok" if m["streak"] else "dim"),
+            (str(m["best"]), "best streak", "accent2"),
+            (str(m["last7"]), "done, last 7 days", "fg"),
+            ("%s %s" % ({1: s["up"], -1: s["down"], 0: s["flat"]}[m["trend"]], word), "vs previous 7 (%d)" % m["prev7"],
+             "ok" if m["trend"] >= 0 else "today"),
+        ])
+        self.put(6, 2, "weekly completions, oldest to newest", self.attr("accent", bold=True))
+        wk = m["weeks"]
+        mx = max(wk + [1])
+        rows = []
+        n = len(wk)
+        for i, v in enumerate(wk):
+            ago = n - 1 - i
+            rows.append(("this week" if ago == 0 else "%d wk ago" % ago, v, str(v)))
+        room = max(0, H - 9)
+        self.hbars(7, 2, min(W - 6, 70), rows[-room:] if room < len(rows) else rows, "accent2", grow)
+        if wk and wk[-1] and wk[-1] >= mx:
+            self.put(min(H - 3, 8 + len(rows)), 2, "this week is your best in %d weeks." % n, self.attr("ok"))
+
+    def act_changes(self):
+        ranges = [1, 7, 14, 30]
+        S = {"ri": 1, "scroll": 0}
+
+        def build(W):
+            cut = (today() - dt.timedelta(days=ranges[S["ri"]] - 1)).isoformat()
+            evs = [e for e in self.store.history if e["t"][:10] >= cut]
+            evs.sort(key=lambda e: e["t"], reverse=True)
+            lines = []
+            last = ""
+            for e in evs:
+                day = e["t"][:10]
+                if day != last:
+                    if lines:
+                        lines.append(("", "fg", False))
+                    lines.append((day, "accent2", True))
+                    last = day
+                t = self.store.get(e["id"])
+                title = t["title"] if t else "(deleted)"
+                label = HIST_LABEL.get(e["k"], e["k"])
+                det = "" if e["k"] in ("created", "done", "reopen") else "  " + e["d"]
+                txt = "%s %-10s %s%s" % (e["t"][11:16], label, title, det)
+                lines.append((clip(txt, W - 6), "ok" if e["k"] == "done" else "fg", False))
+            return lines, len(evs)
+
+        def render():
+            H, W = self.scr.getmaxyx()
+            self.scr.erase()
+            lines, n = build(W)
+            self.screen_bar(W, "changes", "last %s  %d events " % ("day" if ranges[S["ri"]] == 1 else "%d days" % ranges[S["ri"]], n))
+            room = max(1, H - 3)
+            S["scroll"] = max(0, min(S["scroll"], max(0, len(lines) - room)))
+            if not lines:
+                self.put(2, 2, "nothing changed in this range.", self.attr("dim"))
+            for i, (txt, role, bold) in enumerate(lines[S["scroll"]:S["scroll"] + room]):
+                self.put(1 + i, 2, txt, self.attr(role, bold=bold), W - 4)
+            self.screen_foot(H, W, "j/k scroll   r range   q close")
+
+        def handle(name, ch):
+            if name in ("q", "esc", "ctrl-c") or self.keymap.get(name) == "changes":
+                return True
+            if name in ("j", "down"):
+                S["scroll"] += 1
+            elif name in ("k", "up"):
+                S["scroll"] -= 1
+            elif name in ("ctrl-d", "pagedown"):
+                S["scroll"] += 10
+            elif name in ("ctrl-u", "pageup"):
+                S["scroll"] -= 10
+            elif name in ("g", "home"):
+                S["scroll"] = 0
+            elif name == "r":
+                S["ri"] = (S["ri"] + 1) % len(ranges)
+                S["scroll"] = 0
+            return False
+
+        self.screen_loop(render, handle)
+
     def draw_estimates(self, H, W, days, grow):
         samples = est_samples(self.store)
         cal = calibration(samples)
@@ -7152,6 +7389,7 @@ class App:
             "track": self.act_track,
             "focus_mode": self.act_focus,
             "stats": self.act_stats,
+            "changes": self.act_changes,
             "calendar": self.act_calendar,
             "note_add": self.act_note_add,
             "deps": self.act_deps,

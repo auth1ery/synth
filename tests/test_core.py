@@ -431,6 +431,44 @@ class SettingsPanelTests(unittest.TestCase):
         self.assertTrue(synth.save_settings_file(path, {"theme": "nord", "views": [{"name": "x"}]}))
         self.assertEqual(synth.load_settings(path)["views"][0]["name"], "x")
 
+    def test_history_diff_and_record(self):
+        st = synth.Store(os.path.join(tempfile.mkdtemp(), "t.json"))
+        a = st.add("write docs")
+        before = {t["id"]: synth.task_sig(t) for t in st.tasks}
+        a["prio"] = 2
+        a["done"] = True
+        a["tags"] = ["x"]
+        a["notes"] = "hello"
+        b = st.add("second")
+        st.record_changes(before)
+        kinds = [(e["id"], e["k"]) for e in st.history]
+        self.assertIn((a["id"], "prio"), kinds)
+        self.assertIn((a["id"], "done"), kinds)
+        self.assertIn((a["id"], "tags"), kinds)
+        self.assertIn((a["id"], "notes"), kinds)
+        self.assertIn((b["id"], "created"), kinds)
+        tl = synth.history_for(st, a["id"])
+        self.assertEqual(tl[0]["k"], "created")
+        before = {t["id"]: synth.task_sig(t) for t in st.tasks}
+        st.delete([b["id"]])
+        st.record_changes(before)
+        self.assertFalse([e for e in st.history if e["id"] == b["id"]])
+        st.save()
+        st2 = synth.Store(st.path)
+        self.assertEqual(len(st2.history), len(st.history))
+
+    def test_momentum(self):
+        td = dt.date(2026, 10, 15)
+        days = [(td - dt.timedelta(days=i)).isoformat() for i in range(3)]
+        days += [(td - dt.timedelta(days=9)).isoformat()]
+        m = synth.momentum_info(days, td)
+        self.assertEqual(m["streak"], 3)
+        self.assertEqual(m["last7"], 3)
+        self.assertEqual(m["prev7"], 1)
+        self.assertEqual(m["trend"], 1)
+        self.assertEqual(len(m["weeks"]), 8)
+        self.assertEqual(synth.momentum_info([], td)["streak"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
