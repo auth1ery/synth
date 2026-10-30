@@ -16,11 +16,13 @@ import json
 import math
 import os
 import re
+import select
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import textwrap
 import time
 import unicodedata
@@ -114,6 +116,8 @@ DEFAULT_KEYS = {
     "detail_up": ["ctrl-y"],
     "detail_tab": ["I"],
     "changes": ["W"],
+    "git": ["ctrl-g"],
+    "review": ["R"],
     "duplicate": ["alt-y"],
     "yank": ["y"],
     "settings": [","],
@@ -177,6 +181,8 @@ ACTION_DOC = {
     "journal": "daily journal",
     "habits": "habit tracker",
     "changes": "what changed (timeline of edits)",
+    "git": "git menu: TODOs, branches, commits, data sync",
+    "review": "weekly review",
     "projects": "projects and goals",
     "template": "new task from a template",
     "actions_menu": "custom actions and templates",
@@ -229,6 +235,14 @@ DEFAULTS = {
     "header_habits": True,
     "header_momentum": True,
     "history": True,
+    "sync_output": True,
+    "git_sync": False,
+    "git_push": False,
+    "git_commit_delay": 5,
+    "git_auto_done": True,
+    "git_refresh": 5,
+    "todo_markers": ["TODO", "FIXME", "HACK", "XXX"],
+    "review_nudge": True,
     "header_clock": False,
     "header_left": ["app", "view", "sort", "query", "selection"],
     "header_right": ["timer", "overdue", "momentum", "habits", "clock", "progress"],
@@ -285,11 +299,11 @@ STR_OPTS = {
 }
 
 SORTS = ["manual", "priority", "due", "created", "alpha"]  # custom sorts are added from [sorts]
-BOOL_OPTS = ["clock_12h", "clock_seconds", "header_momentum", "history", "snooze_hide", "notes_inline", "header_habits", "header_clock", "header_progress", "header_info",
+BOOL_OPTS = ["sync_output", "git_sync", "git_push", "git_auto_done", "review_nudge", "clock_12h", "clock_seconds", "header_momentum", "history", "snooze_hide", "notes_inline", "header_habits", "header_clock", "header_progress", "header_info",
              "sidebar_counts", "mouse",
              "sidebar", "ascii", "transparent", "exact_colors", "animations", "show_done", "cascade_done",
              "confirm_delete", "focus_auto", "focus_bell"]
-INT_OPTS = ["indent", "sidebar_width", "detail_size", "scrolloff", "focus_work", "focus_break", "focus_long", "focus_rounds"]
+INT_OPTS = ["git_commit_delay", "git_refresh", "indent", "sidebar_width", "detail_size", "scrolloff", "focus_work", "focus_break", "focus_long", "focus_rounds"]
 FLOAT_OPTS = ["anim_speed"]
 
 UNICODE_SYMBOLS = {
@@ -318,6 +332,7 @@ UNICODE_SYMBOLS = {
     "blocked": "⊘",
     "snooze": "◌",
     "wake": "▲",
+    "git": "⎇",
     "up": "▲",
     "down": "▼",
     "flat": "▬",
@@ -349,6 +364,7 @@ ASCII_SYMBOLS = {
     "blocked": "X",
     "snooze": "z",
     "wake": "^",
+    "git": "g",
     "up": "+",
     "down": "-",
     "flat": "=",
@@ -887,7 +903,7 @@ def blank_task(tid, title):
         "id": tid, "title": title, "done": False, "prio": 0, "due": None, "tags": [],
         "project": "", "notes": "", "created": now_iso(), "done_at": None,
         "parent": None, "folded": False, "repeat": "", "est": 0,
-        "deps": [], "snooze": "",
+        "deps": [], "snooze": "", "git": {}, "src": {},
     }
 
 
@@ -908,6 +924,8 @@ class Store:
         self.journal = {}
         self.goals = []
         self.history = []
+        self.change_lines = []
+        self.on_save = None
         self.load()
 
     def load(self):
@@ -944,6 +962,9 @@ class Store:
                            "history": self.history}, fh, indent=1, ensure_ascii=False)
             os.replace(tmp, self.path)
             self.mtime = os.path.getmtime(self.path)
+            if self.on_save:
+                lines, self.change_lines = self.change_lines, []
+                self.on_save(lines)
         except OSError:
             with contextlib.suppress(OSError):
                 os.unlink(tmp)
@@ -994,10 +1015,17 @@ class Store:
             old = before.get(t["id"])
             if old is None:
                 self.history.append({"t": stamp, "id": t["id"], "k": "created", "d": t["title"]})
+                self.change_lines.append("created #%d %s" % (t["id"], clip(t["title"], 60)))
                 continue
             for k, d in diff_sig(old, t):
                 self.history.append({"t": stamp, "id": t["id"], "k": k, "d": d})
-        if any(i not in live for i in before):
+                label = HIST_LABEL.get(k, k)
+                self.change_lines.append("%s #%d %s%s" % (label, t["id"], clip(t["title"], 50),
+                                                         (": " + clip(d, 50)) if d and k not in ("done", "reopen") else ""))
+        gone = [i for i in before if i not in live]
+        for i in gone:
+            self.change_lines.append("deleted #%d %s" % (i, clip(before[i]["title"], 50)))
+        if gone:
             self.history = [e for e in self.history if e["id"] in live]
         del self.history[:-HISTORY_CAP]
 
@@ -1342,7 +1370,7 @@ def task_sig(t):
     return {"title": t["title"], "done": bool(t["done"]), "prio": t["prio"], "due": t["due"],
             "project": t["project"], "tags": list(t["tags"]), "snooze": t.get("snooze", ""),
             "deps": list(t.get("deps", [])), "notes": t["notes"], "est": t.get("est", 0),
-            "repeat": t["repeat"]}
+            "repeat": t["repeat"], "branch": (t.get("git") or {}).get("branch", "")}
 
 
 def diff_sig(old, t):
@@ -1382,13 +1410,15 @@ def diff_sig(old, t):
                                          fmt_duration(new["est"]) if new["est"] else "none")))
     if old["repeat"] != new["repeat"]:
         out.append(("repeat", new["repeat"] or "cleared"))
+    if old.get("branch", "") != new["branch"]:
+        out.append(("branch", ("linked " + new["branch"]) if new["branch"] else "unlinked"))
     return out
 
 
 HIST_LABEL = {"created": "created", "done": "completed", "reopen": "reopened", "title": "renamed",
               "prio": "priority", "due": "due date", "project": "project", "tags": "tags",
               "snooze": "snoozed", "deps": "dependencies", "notes": "notes", "est": "estimate",
-              "repeat": "repeat"}
+              "repeat": "repeat", "branch": "branch"}
 
 
 def history_for(store, tid):
@@ -1418,6 +1448,385 @@ def momentum_info(iso_days, td, weeks=8):
     for w in range(weeks - 1, -1, -1):
         wk.append(sum(c.get((td - dt.timedelta(days=w * 7 + i)).isoformat(), 0) for i in range(7)))
     return {"streak": cur, "best": best, "last7": last, "prev7": prev, "trend": trend, "weeks": wk}
+
+
+# ---------------------------------------------------------------------------
+# git helpers (pure functions plus thin subprocess wrappers)
+# ---------------------------------------------------------------------------
+
+TODO_RE = re.compile(r"\b(TODO|FIXME|HACK|XXX)\b(?:\([^)]*\))?[\s:\[-]*(.*)$")
+TODO_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", "target", ".mypy_cache", ".tox"}
+
+
+def git_run(args, cwd, timeout=10):
+    """Run git. Returns (returncode, text). Never raises."""
+    try:
+        r = subprocess.run(["git"] + list(args), cwd=cwd, capture_output=True, text=True, errors="replace",
+                           timeout=timeout, env=dict(os.environ, GIT_TERMINAL_PROMPT="0", LC_ALL="C"))
+    except (OSError, subprocess.SubprocessError):
+        return 127, ""
+    return r.returncode, (r.stdout if r.returncode == 0 else (r.stdout + r.stderr))
+
+
+def git_root(path):
+    if not path or not os.path.isdir(os.path.expanduser(path)):
+        return None
+    rc, out = git_run(["rev-parse", "--show-toplevel"], os.path.expanduser(path))
+    return out.strip() if rc == 0 and out.strip() else None
+
+
+def git_current_branch(cwd):
+    rc, out = git_run(["rev-parse", "--abbrev-ref", "HEAD"], cwd)
+    name = out.strip()
+    return name if rc == 0 and name and name != "HEAD" else ""
+
+
+def git_branches(cwd):
+    rc, out = git_run(["for-each-ref", "--format=%(refname:short)", "refs/heads"], cwd)
+    return [b for b in out.split("\n") if b.strip()] if rc == 0 else []
+
+
+def git_rev(cwd, ref):
+    rc, out = git_run(["rev-parse", "--verify", "--quiet", ref], cwd)
+    return out.strip() if rc == 0 else ""
+
+
+def git_default_branch(cwd):
+    rc, out = git_run(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], cwd)
+    if rc == 0 and out.strip():
+        return out.strip().split("/", 1)[-1]
+    have = git_branches(cwd)
+    for name in ("main", "master", "trunk", "develop"):
+        if name in have:
+            return name
+    return git_current_branch(cwd)
+
+
+def git_is_ancestor(cwd, a, b):
+    return git_run(["merge-base", "--is-ancestor", a, b], cwd)[0] == 0
+
+
+def git_log(cwd, n=40):
+    rc, out = git_run(["log", "-n", str(n), "--format=%h%x09%s"], cwd)
+    rows = []
+    for ln in out.split("\n") if rc == 0 else []:
+        if "\t" in ln:
+            sha, subj = ln.split("\t", 1)
+            rows.append((sha, subj))
+    return rows
+
+
+def git_slug(title, tid):
+    words = re.findall(r"[a-z0-9]+", title.lower())[:6]
+    return "synth/%d-%s" % (tid, "-".join(words) or "task")
+
+
+def todo_clean(text):
+    text = text.strip()
+    for tail in ("*/", "-->", '"""', "'''", "#}", "--}}"):
+        if text.endswith(tail):
+            text = text[:-len(tail)].strip()
+    return text
+
+
+def parse_todo_line(line):
+    """Return (kind, text) for a source line holding a marker, else None."""
+    m = TODO_RE.search(line)
+    if not m:
+        return None
+    text = todo_clean(m.group(2))
+    if not text:
+        return None
+    return m.group(1), text
+
+
+def todo_key(path, kind, text):
+    import hashlib
+    return "%s|%s" % (path, hashlib.sha1(("%s %s" % (kind, text)).encode("utf-8", "replace")).hexdigest()[:10])
+
+
+def scan_todos(root, markers=None, limit=400):
+    """Find TODO style markers in a folder. Uses git grep inside a repo, a plain walk otherwise."""
+    markers = [m for m in (markers or ["TODO", "FIXME", "HACK", "XXX"]) if re.fullmatch(r"[A-Z]{2,12}", str(m))]
+    if not markers:
+        return []
+    root = os.path.expanduser(root)
+    out = []
+    pat = r"\b(%s)\b" % "|".join(markers)
+    if git_root(root) is not None:
+        rc, text = git_run(["grep", "-n", "-I", "--untracked", "--exclude-standard", "-E", pat], root, timeout=20)
+        if rc not in (0, 1):
+            text = ""
+        for ln in text.split("\n"):
+            parts = ln.split(":", 2)
+            if len(parts) < 3 or not parts[1].isdigit():
+                continue
+            hit = parse_todo_line(parts[2])
+            if hit and hit[0] in markers:
+                out.append({"file": parts[0], "line": int(parts[1]), "kind": hit[0], "text": hit[1],
+                            "key": todo_key(parts[0], hit[0], hit[1])})
+            if len(out) >= limit:
+                break
+        return out
+    rx = re.compile(pat)
+    for base, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in TODO_SKIP_DIRS and not d.startswith(".")]
+        for fn in files:
+            full = os.path.join(base, fn)
+            try:
+                if os.path.getsize(full) > 512 * 1024:
+                    continue
+                with open(full, "r", encoding="utf-8") as fh:
+                    for n, ln in enumerate(fh, 1):
+                        if rx.search(ln):
+                            hit = parse_todo_line(ln)
+                            if hit and hit[0] in markers:
+                                rel = os.path.relpath(full, root)
+                                out.append({"file": rel, "line": n, "kind": hit[0], "text": hit[1],
+                                            "key": todo_key(rel, hit[0], hit[1])})
+                                if len(out) >= limit:
+                                    return out
+            except (OSError, UnicodeDecodeError):
+                continue
+    return out
+
+
+CLOSE_RE = re.compile(r"\b(?:closes|close|fixes|fix|done|finishes|resolves)\s+synth:(\d+)", re.I)
+MENTION_RE = re.compile(r"\bsynth:(\d+)", re.I)
+
+
+def parse_commit_refs(subject, body=""):
+    """Return {task id: closes?} for synth:ID mentions in a commit message."""
+    text = subject + "\n" + body
+    refs = {int(i): False for i in MENTION_RE.findall(text)}
+    for i in CLOSE_RE.findall(text):
+        refs[int(i)] = True
+    return refs
+
+
+def git_mentions(cwd):
+    """Commits that mention synth:ID. Returns [(sha, subject, {id: closes})]."""
+    rc, out = git_run(["log", "--all", "-n", "300", "-i", "-E", "--grep", r"synth:[0-9]+",
+                       "--format=%h%x1f%s%x1f%b%x1e"], cwd, timeout=15)
+    rows = []
+    for rec in out.split("\x1e") if rc == 0 else []:
+        parts = rec.strip("\n").split("\x1f")
+        if len(parts) >= 2 and parts[0].strip():
+            refs = parse_commit_refs(parts[1], parts[2] if len(parts) > 2 else "")
+            if refs:
+                rows.append((parts[0].strip(), parts[1], refs))
+    return rows
+
+
+def git_probe(job):
+    """Check one linked branch. job: {id, repo, branch, base}. Returns a state string."""
+    repo, branch = job["repo"], job["branch"]
+    tip = git_rev(repo, "refs/heads/" + branch)
+    if not tip:
+        return "missing"
+    if tip == job.get("base"):
+        return "active"
+    default = git_default_branch(repo)
+    if branch == default:
+        return "active"
+    for ref in (default, "origin/" + default):
+        if git_rev(repo, ref) and git_is_ancestor(repo, tip, ref):
+            return "merged"
+    return "active"
+
+
+def change_summary(lines):
+    """Commit message for a batch of change lines."""
+    lines = [x for x in lines if x]
+    if not lines:
+        return "synth: update"
+    if len(lines) == 1:
+        return "synth: " + lines[0]
+    return "synth: %d changes\n\n%s" % (len(lines), "\n".join("- " + x for x in lines[:40]))
+
+
+class DataSync:
+    """Keeps the data folder in a git repository: debounced commits, optional pull and push."""
+
+    IGNORE = "state.json\n.todos-*\n*.tmp\n"
+
+    def __init__(self, directory):
+        self.dir = directory
+        self.lock = threading.Lock()
+        self.lines = []
+        self.due = 0.0
+        self.delay = 5.0
+        self.push = False
+        self.status = "off"
+        self.detail = ""
+        self.worker = None
+
+    def enabled(self):
+        return os.path.isdir(os.path.join(self.dir, ".git"))
+
+    def setup(self):
+        """git init the data folder when needed. Returns True when ready."""
+        if self.enabled():
+            self.status = "synced" if self.status == "off" else self.status
+            return True
+        os.makedirs(self.dir, exist_ok=True)
+        if git_run(["init", "-q"], self.dir)[0] != 0:
+            self.status, self.detail = "error", "git init failed"
+            return False
+        ig = os.path.join(self.dir, ".gitignore")
+        if not os.path.exists(ig):
+            with open(ig, "w", encoding="utf-8") as fh:
+                fh.write(self.IGNORE)
+        self.status = "pending"
+        self.commit("synth: start tracking data")
+        return True
+
+    def has_remote(self):
+        rc, out = git_run(["remote"], self.dir)
+        return rc == 0 and bool(out.strip())
+
+    def identity(self):
+        args = []
+        if not git_run(["config", "user.name"], self.dir)[1].strip():
+            args += ["-c", "user.name=synth"]
+        if not git_run(["config", "user.email"], self.dir)[1].strip():
+            args += ["-c", "user.email=synth@localhost"]
+        return args
+
+    def commit(self, message):
+        git_run(["add", "-A"], self.dir)
+        rc, out = git_run(["status", "--porcelain"], self.dir)
+        if rc != 0 or not out.strip():
+            return False
+        rc, out = git_run(self.identity() + ["commit", "-q", "-m", message], self.dir)
+        if rc != 0:
+            self.status, self.detail = "error", out.strip().split("\n")[-1][:80]
+            return False
+        return True
+
+    def pull(self):
+        if not (self.push and self.has_remote()):
+            return True
+        rc, out = git_run(["pull", "--rebase", "--autostash", "-q"], self.dir, timeout=30)
+        if rc != 0:
+            git_run(["rebase", "--abort"], self.dir)
+            self.status, self.detail = "conflict", out.strip().split("\n")[-1][:80]
+            return False
+        return True
+
+    def send(self):
+        if not (self.push and self.has_remote()):
+            self.status = "synced"
+            return
+        rc, out = git_run(["push", "-q"], self.dir, timeout=30)
+        if rc != 0:
+            rc2, out2 = git_run(["push", "-q", "-u", "origin", "HEAD"], self.dir, timeout=30)
+            if rc2 != 0:
+                self.status, self.detail = "error", out2.strip().split("\n")[-1][:80]
+                return
+        self.status = "synced"
+
+    def mark(self, lines, delay=None):
+        if not self.enabled():
+            return
+        with self.lock:
+            self.lines += list(lines)
+            self.due = time.time() + (self.delay if delay is None else delay)
+            self.status = "pending"
+            if self.worker is None or not self.worker.is_alive():
+                self.worker = threading.Thread(target=self._run, daemon=True)
+                self.worker.start()
+
+    def _run(self):
+        while True:
+            with self.lock:
+                wait = self.due - time.time()
+            if wait > 0:
+                time.sleep(min(wait, 0.5))
+                continue
+            self.flush()
+            with self.lock:
+                if time.time() >= self.due and not self.lines:
+                    return
+
+    def flush(self):
+        with self.lock:
+            lines, self.lines = self.lines, []
+        if not lines and self.status != "pending":
+            return
+        if self.commit(change_summary(lines)) or self.status == "pending":
+            self.status = "synced"
+            self.send()
+        elif self.status == "pending":
+            self.status = "synced"
+
+    def finish(self, timeout=8.0):
+        """Commit anything still waiting. Called when the app quits."""
+        with self.lock:
+            self.due = 0.0
+        w = self.worker
+        if w is not None and w.is_alive():
+            w.join(timeout)
+        if self.lines:
+            self.flush()
+
+
+def last_touch(store, t):
+    """Date string of the last time a task changed (history, creation or completion)."""
+    stamps = [t["created"]]
+    stamps += [e["t"] for e in store.history if e["id"] == t["id"]]
+    return max(stamps)[:10]
+
+
+def review_data(store, td, days=7, stale_days=21):
+    """Everything the weekly review shows, computed from the store."""
+    iso = td.isoformat()
+    cut = (td - dt.timedelta(days=days - 1)).isoformat()
+    prev_cut = (td - dt.timedelta(days=2 * days - 1)).isoformat()
+    events = [e for e in store.done_log if e["t"][:10] >= cut]
+    prev = sum(1 for e in store.done_log if prev_cut <= e["t"][:10] < cut)
+    titles, seen = [], set()
+    by = collections.Counter()
+    for e in sorted(events, key=lambda e: e["t"], reverse=True):
+        by[e.get("p") or "(none)"] += 1
+        if e["id"] in seen:
+            continue
+        seen.add(e["id"])
+        t = store.get(e["id"])
+        name = t["title"] if t else e.get("n", "")
+        if name:
+            titles.append((name, (t["project"] if t else e.get("p", "")) or ""))
+    spent = sum(e["s"] for e in store.time_log if e["t"][:10] >= cut)
+    live = [t for t in store.tasks if not t["done"] and not is_snoozed(t, td)]
+    slipped = sorted((t for t in live if t["due"] and t["due"] < iso), key=lambda t: (t["due"], -t["prio"]))
+    end = (td + dt.timedelta(days=days)).isoformat()
+    ahead = sorted((t for t in live if t["due"] and iso <= t["due"] <= end), key=lambda t: (t["due"], -t["prio"]))
+    old = (td - dt.timedelta(days=stale_days)).isoformat()
+    age, stale = {}, []
+    for t in live:
+        if t["due"] or t.get("snooze"):
+            continue
+        lt = last_touch(store, t)
+        if lt <= old:
+            stale.append(t)
+            age[t["id"]] = (td - dt.date.fromisoformat(lt)).days
+    stale.sort(key=lambda t: -age[t["id"]])
+    cur, _ = streak_info({e["t"][:10] for e in store.done_log}, td) if store.done_log else (0, 0)
+    return {"done": len(events), "prev": prev, "time": spent, "streak": cur, "titles": titles,
+            "by_project": by.most_common(), "slipped": slipped, "stale": stale, "ahead": ahead, "age": age,
+            "ahead_est": sum(t.get("est", 0) for t in ahead)}
+
+
+def review_text(d, td):
+    lines = ["# weekly review, week ending %s" % td.isoformat(), "",
+             "done: %d tasks (the 7 days before: %d)%s" % (d["done"], d["prev"], ", %s tracked" % fmt_duration(d["time"]) if d["time"] else ""),
+             "streak: %d days" % d["streak"], "", "## wins"]
+    lines += ["- " + t for t, _ in d["titles"][:8]] or ["- (nothing logged)"]
+    lines += ["", "## loose ends", "- %d overdue, %d untouched for 3 weeks" % (len(d["slipped"]), len(d["stale"])),
+              "", "## next week"]
+    lines += ["- %s  %s" % (t["due"], t["title"]) for t in d["ahead"][:8]] or ["- (nothing due)"]
+    lines += ["", "## notes", "went well: ", "change: "]
+    return "\n".join(lines)
 
 
 BIG_DIGITS = {
@@ -2012,7 +2421,7 @@ HOOK_EVENTS = {
 STRING_KEYS = {"app_name": "Name shown in the header.", "empty": "Text for an empty list.",
                "add_title": "Title of the add task prompt."}
 HEADER_WIDGETS = ["app", "view", "sort", "query", "selection", "timer", "progress", "momentum", "habits", "clock",
-                  "date", "open", "overdue", "due_today", "greeting", "week", "text"]
+                  "date", "open", "overdue", "due_today", "greeting", "week", "text", "sync"]
 COLUMN_CHOICES = ["check", "prio", "id", "title", "est", "tags", "project", "time", "due", "deps", "snooze", "created"]
 SCREEN_CHOICES = ["list", "journal", "habits", "projects", "stats", "calendar", "agenda"]
 ROLE_DOC = {
@@ -2109,6 +2518,7 @@ def build_settings_tree():
            available=HEADER_WIDGETS, required=[]),
         _s("header_right", "Top Bar, Right Widgets", "order", "Widgets on the right of the top bar, in order.",
            available=HEADER_WIDGETS, required=[]),
+        _s("sync_output", "Flicker-free Drawing", "bool", "Draw each frame as one synchronized update. Turn off if your terminal prints stray characters."),
         _s("header_style", "Top Bar Style", "choice", "plain, divided (separator lines) or pills (each widget on its own background).",
            choices=["plain", "divided", "pills"]),
         _s("clock_12h", "12 Hour Clock", "bool", "Show the clock as 3:07 PM instead of 15:07."),
@@ -2141,6 +2551,18 @@ def build_settings_tree():
         _s("focus_rounds", "Rounds Per Set", "int", "Work rounds before a long break.", min=1, max=12),
         _s("focus_auto", "Auto Start Next Phase", "bool", "Start the next phase without waiting."),
         _s("focus_bell", "Bell", "bool", "Ring the terminal bell when a phase ends."),
+    ]
+    gitset = [
+        _s("git_sync", "Track Data in Git", "bool", "Commit your todo data to git after every change, with a message listing what changed."),
+        _s("git_push", "Push and Pull", "bool", "Pull when synth starts and push after each commit. Needs a remote named origin in the data folder."),
+        _s("git_commit_delay", "Commit Delay (seconds)", "int", "Wait this long after the last change so a burst becomes one commit.", min=1, max=300),
+        _s("git_auto_done", "Complete From Git", "bool", "Mark a task done when its linked branch is merged or a commit says closes synth:ID."),
+        _s("git_refresh", "Check Git Every (minutes)", "int", "How often linked branches and commits are checked. 0 turns the timer off.", min=0, max=240),
+        _s("todo_markers", "TODO Markers", "strlist", "Comment markers the TODO scanner looks for, comma separated."),
+        _s(None, "Track Data Folder Now", "action", "Run git init in the data folder and start committing.", run="git_setup", button="Set up"),
+    ]
+    review = [
+        _s("review_nudge", "Review Reminder", "bool", "Remind you on start when the last weekly review is a week old."),
     ]
     views = [
         _s("views", "Custom Views", "records", "Saved filters that appear in the sidebar. Each can have its own sort, columns and icon.",
@@ -2177,6 +2599,8 @@ def build_settings_tree():
         _node("Tasks", tasks),
         _node("Notes and Journal", notes),
         _node("Focus", focus),
+        _node("Git", gitset),
+        _node("Weekly Review", review),
         _node("Keybindings", dyn="keys", blurb="Comma separated keys. Chords like g g work. Type none to unbind."),
         _node("Views and Sorts", views),
         _node("Styling Rules", rules),
@@ -2274,6 +2698,12 @@ class App:
         self.last_click = (0.0, -1)
         self.geo = {}
         self.running = True
+        self.sync = DataSync(os.path.dirname(store.path))
+        self.git_thread = None
+        self.git_results = []
+        self.git_next = time.time() + 3
+        self.git_force = False
+        store.on_save = self.on_store_save
         self.anims = {}
         self.bar_disp = 0.0
         self.bar_busy = False
@@ -2333,6 +2763,9 @@ class App:
             for j in range(1, len(parts)):
                 self.chord_prefixes.add(" ".join(parts[:j]))
         self.rules = compile_rules(self.opts.get("rules", []), self.store)
+        if getattr(self, "sync", None) is not None:
+            self.sync.delay = max(1.0, float(self.opts.get("git_commit_delay", 5) or 5))
+            self.sync.push = bool(self.opts.get("git_push"))
         self.set_theme(self.opts["theme"])
         if first:
             wanted = self.args.view or self.state.get("view", "all")
@@ -2945,7 +3378,7 @@ class App:
     # ----- palette -----
 
     COMMANDS = ["settings", "journal", "habits", "projects", "goals", "note", "snooze", "deps", "template", "run", "theme", "sort", "view", "filter", "set", "export", "clear", "reload", "config",
-                "add", "stats", "changes", "calendar", "agenda", "focus", "track", "find", "links", "help", "quit", "w", "q"]
+                "add", "stats", "changes", "review", "git", "todos", "sync", "calendar", "agenda", "focus", "track", "find", "links", "help", "quit", "w", "q"]
 
     def act_palette(self):
         text = self.prompt(":", "", complete=self.COMMANDS, hist="cmd")
@@ -3004,6 +3437,17 @@ class App:
             self.act_stats()
         elif cmd in ("changes", "history"):
             self.act_changes()
+        elif cmd == "review":
+            self.act_review()
+        elif cmd == "git":
+            self.act_git()
+        elif cmd == "todos":
+            self.act_git_todos()
+        elif cmd == "sync":
+            if self.sync.enabled():
+                self.act_sync_now()
+            else:
+                self.act_sync_setup()
         elif cmd == "calendar":
             self.act_calendar()
         elif cmd == "agenda":
@@ -3192,6 +3636,25 @@ class App:
         if title:
             self.put(y, x + 2, " " + clip(title, w - 6) + " ", self.attr("accent", bold=True))
 
+    def present(self):
+        """Flush the screen inside a synchronized update so terminals never show half a frame."""
+        sync = self.opts.get("sync_output", True) and not os.environ.get("SYNTH_NO_SYNC")
+        if sync:
+            with contextlib.suppress(OSError, ValueError):
+                os.write(sys.__stdout__.fileno(), b"\x1b[?2026h")
+        try:
+            self.scr.refresh()
+        finally:
+            if sync:
+                with contextlib.suppress(OSError, ValueError):
+                    os.write(sys.__stdout__.fileno(), b"\x1b[?2026l")
+
+    def input_pending(self):
+        try:
+            return bool(select.select([sys.stdin], [], [], 0)[0])
+        except (OSError, ValueError):
+            return False
+
     def read_key(self):
         """Return (name, char)."""
         while True:
@@ -3245,7 +3708,7 @@ class App:
             for i, (ln, role) in enumerate(lines):
                 self.put(y + 2 + i, x + 2, clip(ln, inner), self.attr(role))
             self.put(y + 2 + len(lines), x + 2, "enter accept  esc cancel", self.attr("dim"))
-            self.scr.refresh()
+            self.present()
             name, ch = self.read_key()
             if name in ("enter",):
                 if hist and text.strip():
@@ -3330,7 +3793,7 @@ class App:
                 if sel:
                     self.fill(y + 2 + r, x + 1, w - 2, a)
                 self.put(y + 2 + r, x + 3, options[i], a, w - 6)
-            self.scr.refresh()
+            self.present()
             name, ch = self.read_key()
             old = index
             if name in ("down", "j", "ctrl-n"):
@@ -3353,7 +3816,7 @@ class App:
             self.box(y, x, 5, w, "confirm")
             self.put(y + 2, x + 2, clip(msg, w - 4), self.attr("fg"))
             self.put(y + 3, x + 2, "y yes   n no", self.attr("dim"))
-            self.scr.refresh()
+            self.present()
             name, ch = self.read_key()
             if name in ("y", "Y", "enter"):
                 return True
@@ -3375,7 +3838,7 @@ class App:
                     text, role = lines[i]
                     self.put(y + 1 + r, x + 2, text, self.attr(role, bold=(role == "accent")), w - 4)
             self.put(y + h - 2, x + 2, "j/k scroll  any other key closes", self.attr("dim"))
-            self.scr.refresh()
+            self.present()
             name, ch = self.read_key()
             if name in ("down", "j"):
                 top = min(max(0, len(lines) - vis), top + 1)
@@ -3411,7 +3874,7 @@ class App:
             ("NOTES, LINKS, PLANNING", ["notes", "note_add", "links", "link_add", "deps", "snooze", "template",
                                         "actions_menu"]),
             ("FILTER AND SORT", ["search", "clear_filter", "sort", "hide_done"]),
-            ("SCREENS AND TOOLS", ["journal", "habits", "projects", "calendar", "stats", "changes", "focus_mode", "track",
+            ("SCREENS AND TOOLS", ["journal", "habits", "projects", "calendar", "stats", "changes", "review", "git", "focus_mode", "track",
                                    "theme", "settings", "palette", "help", "quit"]),
         ]
         seen = set()
@@ -3551,6 +4014,12 @@ class App:
             return "good " + ("morning" if h < 12 else "afternoon" if h < 18 else "evening"), "accent2", False
         if name == "week":
             return "week %d" % td.isocalendar()[1], "dim", False
+        if name == "sync":
+            if not (o.get("git_sync") and self.sync.enabled()):
+                return None
+            st = self.sync.status
+            glyph = {"synced": s["check_on"], "pending": s["bullet"], "conflict": s["blocked"], "error": s["blocked"]}.get(st, s["bullet"])
+            return "git %s %s" % (glyph, st), {"synced": "ok", "pending": "accent2"}.get(st, "overdue"), False
         if name == "text":
             return (o.get("header_text") or None) and (o["header_text"], "accent2", False)
         return None
@@ -3679,7 +4148,7 @@ class App:
         else:
             self.put(H - 1, 1, self.hint_line(), self.attr("dim", "bar_bg"), left_w)
         self.put(H - 1, W - cell_len(right) - 2, right, self.attr("accent2", "bar_bg"))
-        scr.refresh()
+        self.present()
 
     def first_key(self, action):
         for n, a in self.keymap.items():
@@ -3817,6 +4286,9 @@ class App:
                         suffix += " " + self.sym["link"]
                     if blocked:
                         suffix += " " + self.sym["blocked"]
+                    gb = t.get("git") or {}
+                    if gb.get("branch") or gb.get("commits") or t.get("src"):
+                        suffix += " " + self.sym["git"]
                     if t.get("woke") == iso_today and not done:
                         suffix += " " + self.sym["wake"]
                     if is_snoozed(t, td):
@@ -3960,6 +4432,13 @@ class App:
                 hint = self.est_hint(t["est"]) if t.get("est") and not t["done"] else ""
                 if hint:
                     row("", hint, "dim")
+            gi = t.get("git") or {}
+            if gi.get("branch"):
+                row("branch", "%s (%s)" % (gi["branch"], gi.get("state", "active")), "ok" if gi.get("state") == "merged" else "accent2")
+            for cm in (gi.get("commits") or [])[:4]:
+                row("commit", cm, "dim")
+            if t.get("src"):
+                row("source", "%s:%s" % (t["src"].get("file", "?"), t["src"].get("line", "?")), "dim")
             lines.append(("", "fg", False))
             row("id", str(t["id"]), "dim")
             row("created", t["created"].replace("T", " ")[:16], "dim")
@@ -4324,7 +4803,7 @@ class App:
             if not shown:
                 self.put(y + 3, x + 3, "no matches", self.attr("dim"))
             self.put(y + h - 2, x + 2, "type to filter  up/down move  enter select  esc cancel", self.attr("dim"), inner)
-            self.scr.refresh()
+            self.present()
             name, ch = self.read_key()
             if name == "enter":
                 return shown[sel][0] if shown else None
@@ -4501,7 +4980,7 @@ class App:
         try:
             while True:
                 render()
-                self.scr.refresh()
+                self.present()
                 name, _ = self.read_key()
                 if name in ("q", "esc", "ctrl-c") or self.keymap.get(name) == "stats":
                     return
@@ -4855,7 +5334,7 @@ class App:
         try:
             while True:
                 by, rows, trows, cur, cdate = render()
-                self.scr.refresh()
+                self.present()
                 name, ch = self.read_key()
                 if name in ("tick", "resize", "mouse"):
                     continue
@@ -4965,7 +5444,7 @@ class App:
                 elif F["running"] and F["phase"] == "work" and time.monotonic() - F["start"] >= 60:
                     self.focus_flush(t, F)
                 self.draw_focus(t, F)
-                self.scr.refresh()
+                self.present()
                 name, _ = self.read_key()
                 if name in ("q", "esc", "ctrl-c"):
                     break
@@ -5185,7 +5664,7 @@ class App:
             self.put(y + 1, x + w - 2 - cell_len(status), status, self.attr("accent2"))
             self.put(y + h - 2, x + 2, "ctrl-s or ctrl-d save   esc cancel   ctrl-t timestamp   tab indent   ctrl-k kill line",
                      self.attr("dim"), inner)
-            self.scr.refresh()
+            self.present()
             name, ch = self.read_key()
             if name in ("tick", "resize", "mouse"):
                 continue
@@ -5699,7 +6178,7 @@ class App:
         try:
             while True:
                 render()
-                self.scr.refresh()
+                self.present()
                 name, ch = self.read_key()
                 if name in ("tick", "resize", "mouse"):
                     continue
@@ -6217,13 +6696,16 @@ class App:
                 elif name == "e" and names:
                     nm = names[P["i"]]
                     meta = self.store.projects.get(nm, {})
-                    init = "status:%s due:%s %s" % (meta.get("status", "active"), meta.get("due", "") or "none", meta.get("desc", ""))
-                    text = self.prompt("%s: status:active|paused due:DATE then a description" % nm, init)
+                    init = "status:%s due:%s path:%s %s" % (meta.get("status", "active"), meta.get("due", "") or "none",
+                                                          meta.get("path", "") or "none", meta.get("desc", ""))
+                    text = self.prompt("%s: status:active|paused due:DATE path:FOLDER then a description" % nm, init)
                     if text is not None:
-                        m = {"status": "active", "due": "", "desc": []}
+                        m = {"status": "active", "due": "", "desc": [], "path": ""}
                         for tok in text.split():
                             if tok.startswith("status:") and tok[7:] in self.PROJECT_STATUS:
                                 m["status"] = tok[7:]
+                            elif tok.startswith("path:"):
+                                m["path"] = "" if tok[5:] == "none" else tok[5:]
                             elif tok.startswith("due:"):
                                 try:
                                     pd = parse_date(tok[4:], td)
@@ -6233,7 +6715,10 @@ class App:
                             else:
                                 m["desc"].append(tok)
                         with self.edit():
-                            self.store.projects[nm] = {"status": m["status"], "due": m["due"], "desc": " ".join(m["desc"])}
+                            newm = {"status": m["status"], "due": m["due"], "desc": " ".join(m["desc"])}
+                            if m["path"]:
+                                newm["path"] = m["path"]
+                            self.store.projects[nm] = newm
                 elif name == "s" and names:
                     nm = names[P["i"]]
                     with self.edit():
@@ -6395,6 +6880,498 @@ class App:
         self.screen_foot(H, W, "j k move  a add  e edit  m milestones  enter open filter  d delete  tab projects  q close")
 
     # ----- estimate accuracy page -----
+
+    # ----- git: data sync, linking, TODO scanning -----
+
+    def on_store_save(self, lines):
+        if self.opts.get("git_sync") and self.sync.enabled():
+            self.sync.mark(lines)
+
+    def startup_sync(self):
+        """Background start: make sure the data folder is a repo and pull when asked to."""
+        def work():
+            if self.sync.setup() and self.sync.push:
+                self.sync.pull()
+        threading.Thread(target=work, daemon=True).start()
+
+    def task_repo(self, t):
+        g = t.get("git") or {}
+        meta = self.store.projects.get(t["project"], {}) if t["project"] else {}
+        for cand in (meta.get("path"), g.get("repo"), os.getcwd()):
+            root = git_root(cand) if cand else None
+            if root:
+                return root
+        return None
+
+    def git_jobs(self):
+        jobs = []
+        for t in self.store.tasks:
+            g = t.get("git") or {}
+            if g.get("branch") and g.get("repo") and not t["done"]:
+                jobs.append({"id": t["id"], "repo": g["repo"], "branch": g["branch"], "base": g.get("base", "")})
+        repos = {m["path"] for m in self.store.projects.values() if m.get("path")}
+        repos |= {(t.get("git") or {}).get("repo") for t in self.store.tasks if (t.get("git") or {}).get("repo")}
+        return jobs, sorted(r for r in repos if r)
+
+    def git_refresh(self, force=False):
+        """Start a background check of linked branches and commit references."""
+        if self.git_thread is not None and self.git_thread.is_alive():
+            return
+        jobs, repos = self.git_jobs()
+        if not jobs and not repos:
+            if force:
+                self.say("nothing linked to git yet", "dim")
+            return
+        self.git_force = force
+
+        def work():
+            res = {"states": {}, "mentions": []}
+            for j in jobs:
+                res["states"][j["id"]] = git_probe(j)
+            for r in repos:
+                root = git_root(r)
+                if root:
+                    res["mentions"] += [(root,) + row for row in git_mentions(root)]
+            self.git_results.append(res)
+        self.git_thread = threading.Thread(target=work, daemon=True)
+        self.git_thread.start()
+
+    def git_apply(self):
+        mins = int(self.opts.get("git_refresh", 5) or 0)
+        if mins and time.time() >= self.git_next:
+            self.git_next = time.time() + mins * 60
+            self.git_refresh()
+        if not self.git_results:
+            return
+        res = self.git_results.pop(0)
+        done_now, linked = [], 0
+        with self.edit():
+            for tid, state in res["states"].items():
+                t = self.store.get(tid)
+                if not t:
+                    continue
+                g = t.setdefault("git", {})
+                g["state"] = state
+                if state == "merged" and not t["done"] and self.opts.get("git_auto_done", True):
+                    self.complete(t, True)
+                    done_now.append(t["title"])
+            for root, sha, subj, refs in res["mentions"]:
+                for tid, closes in refs.items():
+                    t = self.store.get(tid)
+                    if not t:
+                        continue
+                    g = t.setdefault("git", {})
+                    known = g.setdefault("commits", [])
+                    entry = "%s %s" % (sha, subj)
+                    if any(c.split(" ", 1)[0] == sha for c in known):
+                        continue
+                    known.insert(0, entry)
+                    del known[20:]
+                    g.setdefault("repo", root)
+                    linked += 1
+                    if closes and not t["done"] and self.opts.get("git_auto_done", True):
+                        self.complete(t, True)
+                        done_now.append(t["title"])
+        if done_now:
+            self.say("done from git: " + clip(", ".join(done_now), 60), "ok", 6)
+        elif linked:
+            self.say("%d commit%s linked to tasks" % (linked, "" if linked == 1 else "s"), "accent2", 4)
+        elif self.git_force:
+            self.say("git links are up to date", "dim")
+        self.git_force = False
+
+    def act_git(self):
+        t = self.current()
+        opts = []
+        opts.append(("Find TODOs in a project folder", self.act_git_todos))
+        if t:
+            g = t.get("git") or {}
+            opts.append(("Link a branch to this task", lambda: self.act_git_branch(t)))
+            opts.append(("Link a commit to this task", lambda: self.act_git_commit(t)))
+            if g.get("branch") or g.get("commits"):
+                opts.append(("Unlink git from this task", lambda: self.act_git_unlink(t)))
+            if t["project"]:
+                opts.append(("Set folder for @%s" % t["project"], lambda: self.act_git_path(t["project"])))
+        opts.append(("Check branches and commits now", lambda: self.git_refresh(True)))
+        if self.sync.enabled():
+            opts.append(("Sync data now (commit%s)" % (" and push" if self.opts.get("git_push") else ""), self.act_sync_now))
+        else:
+            opts.append(("Track data folder in git", self.act_sync_setup))
+        i = self.menu("git", [o[0] for o in opts])
+        if i is not None:
+            opts[i][1]()
+
+    def act_git_path(self, project=None):
+        if project is None:
+            names = project_names(self.store)
+            if not names:
+                self.say("no projects yet", "dim")
+                return
+            i = self.menu("project folder for", names)
+            if i is None:
+                return
+            project = names[i]
+        cur = self.store.projects.get(project, {}).get("path", "")
+        text = self.prompt("folder for @%s (git repo or source folder, empty clears)" % project, cur or os.getcwd())
+        if text is None:
+            return
+        text = text.strip()
+        if text and not os.path.isdir(os.path.expanduser(text)):
+            self.say("that folder does not exist", "err")
+            return
+        with self.edit():
+            meta = self.store.projects.setdefault(project, {})
+            if text:
+                meta["path"] = text
+            else:
+                meta.pop("path", None)
+        self.say("folder saved for @" + project, "ok")
+
+    def act_git_branch(self, t):
+        repo = self.task_repo(t)
+        if not repo:
+            self.say("no git repo found. set a project folder with the git menu", "err")
+            return
+        branches = git_branches(repo)
+        cur = git_current_branch(repo)
+        make = git_slug(t["title"], t["id"])
+        labels = ["new branch: " + make] + [("* " if b == cur else "  ") + b for b in branches]
+        i = self.menu("link branch (%s)" % os.path.basename(repo), labels)
+        if i is None:
+            return
+        if i == 0:
+            if not self.confirm("create and switch to %s?" % make):
+                return
+            rc, out = git_run(["switch", "-c", make], repo)
+            if rc != 0:
+                self.say("git: " + clip(out.strip().split("\n")[-1], 60), "err", 5)
+                return
+            name = make
+        else:
+            name = branches[i - 1]
+        base = git_rev(repo, "refs/heads/" + name)
+        with self.edit():
+            g = t.setdefault("git", {})
+            g.update({"repo": repo, "branch": name, "base": base, "state": "active"})
+        self.say("linked %s" % name, "ok")
+        self.git_next = 0.0
+
+    def act_git_commit(self, t):
+        repo = self.task_repo(t)
+        if not repo:
+            self.say("no git repo found. set a project folder with the git menu", "err")
+            return
+        rows = git_log(repo, 40)
+        if not rows:
+            self.say("no commits found", "dim")
+            return
+        i = self.menu("link commit", ["%s  %s" % (a, clip(b, 60)) for a, b in rows])
+        if i is None:
+            return
+        with self.edit():
+            g = t.setdefault("git", {})
+            g.setdefault("repo", repo)
+            known = g.setdefault("commits", [])
+            if not any(c.split(" ", 1)[0] == rows[i][0] for c in known):
+                known.insert(0, "%s %s" % rows[i])
+        self.say("commit linked", "ok")
+
+    def act_git_unlink(self, t):
+        with self.edit():
+            t["git"] = {}
+        self.say("git links removed", "ok")
+
+    def act_sync_setup(self):
+        d = self.sync.dir
+        if not self.confirm("track %s in git?" % clip(d, 40)):
+            return
+        if self.sync.setup():
+            self.opts["git_sync"] = True
+            self.persist("git_sync", True)
+            self.say("data folder is now a git repo", "ok")
+            if not self.sync.has_remote():
+                self.say("data folder is now a git repo. add a remote with git remote add origin URL, then enable Push and Pull in settings", "accent2", 8)
+        else:
+            self.say("could not set up git: " + self.sync.detail, "err", 5)
+
+    def act_sync_now(self):
+        self.sync.mark(["manual sync"], delay=0)
+        self.say("syncing...", "dim")
+
+    def act_git_todos(self):
+        cands = sorted((n, m["path"]) for n, m in self.store.projects.items() if m.get("path"))
+        view_p = self.view[2:] if self.view.startswith("p:") else ""
+        names = [n for n, _ in cands]
+        labels = ["%s  (%s)" % (n, clip(p, 40)) for n, p in cands] + ["another folder..."]
+        i = self.menu("find TODOs in", labels, names.index(view_p) if view_p in names else 0)
+        if i is None:
+            return
+        if i < len(cands):
+            pname, path = cands[i]
+        else:
+            path = self.prompt("folder to scan", os.getcwd())
+            if not path or not os.path.isdir(os.path.expanduser(path.strip())):
+                self.say("that folder does not exist", "err")
+                return
+            path = path.strip()
+            pname = self.prompt("project name for imported tasks", re.sub(r"\W+", "-", os.path.basename(os.path.abspath(os.path.expanduser(path)))).strip("-"))
+            if not pname or not pname.strip():
+                return
+            pname = pname.strip().replace(" ", "-")
+            with self.edit():
+                self.store.projects.setdefault(pname, {})["path"] = path
+        repo = os.path.abspath(os.path.expanduser(path))
+        self.say("scanning %s..." % clip(repo, 40), "dim")
+        self.draw()
+        found = scan_todos(repo, self.opts.get("todo_markers"))
+        found.sort(key=lambda f: (f["file"], f["line"]))
+        S = {"i": 0, "top": 0, "sel": set()}
+
+        def tracked():
+            return {t["src"]["key"]: t for t in self.store.tasks
+                    if (t.get("src") or {}).get("key") and t["src"].get("repo") == repo}
+
+        def resolved():
+            keys = {f["key"] for f in found}
+            return [t for k, t in tracked().items() if k not in keys and not t["done"]]
+
+        def render():
+            H, W = self.scr.getmaxyx()
+            self.scr.erase()
+            tr = tracked()
+            new = [f for f in found if f["key"] not in tr]
+            self.screen_bar(W, "todos in @" + pname, "%d found  %d new  %d selected " % (len(found), len(new), len(S["sel"])))
+            room = max(1, H - 3)
+            S["i"] = max(0, min(S["i"], len(found) - 1))
+            S["top"] = max(0, min(S["top"], max(0, len(found) - room)))
+            if S["i"] < S["top"]:
+                S["top"] = S["i"]
+            if S["i"] >= S["top"] + room:
+                S["top"] = S["i"] - room + 1
+            if not found:
+                self.put(2, 2, "no TODO, FIXME, HACK or XXX comments found.", self.attr("dim"))
+            for r in range(room):
+                k = S["top"] + r
+                if k >= len(found):
+                    break
+                f = found[k]
+                on = k == S["i"]
+                known = f["key"] in tr
+                mark = "[x]" if k in S["sel"] else ("[=]" if known else "[ ]")
+                role = "dim" if known else "fg"
+                bg = "sel_bg" if on else "bg"
+                self.fill(1 + r, 0, W, self.attr(role, bg))
+                x = self.put(1 + r, 2, mark + " ", self.attr("ok" if k in S["sel"] else role, bg))
+                x = self.put(1 + r, x, pad(f["kind"], 5) + " ", self.attr("p3" if f["kind"] == "FIXME" else "accent2", bg, bold=True))
+                loc = clip("%s:%d" % (f["file"], f["line"]), 36)
+                x = self.put(1 + r, x, pad(loc, 36) + " ", self.attr("dim", bg))
+                self.put(1 + r, x, f["text"], self.attr(role, bg, bold=on), W - x - 1)
+            gone = len(resolved())
+            hint = "j/k move  space select  a all new  enter import  r rescan  q close"
+            if gone:
+                hint = "%d resolved in code: c completes them   " % gone + hint
+            self.screen_foot(H, W, hint)
+
+        def handle(name, ch):
+            if name in ("q", "esc", "ctrl-c"):
+                return True
+            if name in ("j", "down"):
+                S["i"] += 1
+            elif name in ("k", "up"):
+                S["i"] -= 1
+            elif name in ("g", "home"):
+                S["i"] = 0
+            elif name in ("G", "end"):
+                S["i"] = len(found) - 1
+            elif name in ("ctrl-d", "pagedown"):
+                S["i"] += 10
+            elif name in ("ctrl-u", "pageup"):
+                S["i"] -= 10
+            elif name == "space" and found:
+                if found[S["i"]]["key"] not in tracked():
+                    S["sel"] ^= {S["i"]}
+                S["i"] += 1
+            elif name == "a":
+                tr = tracked()
+                S["sel"] = {k for k, f in enumerate(found) if f["key"] not in tr}
+            elif name == "enter" and found:
+                tr = tracked()
+                pick = sorted(S["sel"]) or [S["i"]]
+                chosen = [found[k] for k in pick if found[k]["key"] not in tr]
+                if not chosen:
+                    self.say("already tracked", "dim")
+                    return False
+                with self.edit():
+                    for f in chosen:
+                        title = f["text"] if f["kind"] == "TODO" else "%s: %s" % (f["kind"], f["text"])
+                        t = self.store.add(title[:140])
+                        t["project"] = pname
+                        t["tags"] = ["todo"]
+                        t["notes"] = "%s:%d" % (f["file"], f["line"])
+                        t["prio"] = 1 if f["kind"] == "FIXME" else 0
+                        t["src"] = {"repo": repo, "file": f["file"], "line": f["line"], "key": f["key"]}
+                S["sel"] = set()
+                self.say("imported %d task%s" % (len(chosen), "" if len(chosen) == 1 else "s"), "ok")
+            elif name == "c":
+                gone = resolved()
+                if gone and self.confirm("complete %d task%s whose comment is gone?" % (len(gone), "" if len(gone) == 1 else "s")):
+                    with self.edit():
+                        for t in gone:
+                            self.complete(t, True)
+                    self.say("completed %d" % len(gone), "ok")
+            elif name == "r":
+                found[:] = sorted(scan_todos(repo, self.opts.get("todo_markers")), key=lambda f: (f["file"], f["line"]))
+                S["sel"] = set()
+                self.say("rescanned", "dim")
+            return False
+
+        self.screen_loop(render, handle)
+
+    # ----- weekly review -----
+
+    def review_data(self):
+        td = today()
+        return review_data(self.store, td)
+
+    def act_review(self):
+        steps = ["wins", "slipped", "stale", "ahead", "reflect"]
+        S = {"step": 0, "i": 0, "top": 0, "text": None}
+
+        def items(d):
+            return {"slipped": d["slipped"], "stale": d["stale"], "ahead": d["ahead"]}.get(steps[S["step"]], [])
+
+        def render():
+            H, W = self.scr.getmaxyx()
+            self.scr.erase()
+            d = self.review_data()
+            self.screen_bar(W, "weekly review", "step %d of %d  %s " % (S["step"] + 1, len(steps), steps[S["step"]]))
+            x = 2
+            for k, nm in enumerate(steps):
+                on = k == S["step"]
+                x = self.put(1, x, " %d %s " % (k + 1, nm), self.attr("accent" if on else "dim", "sel_bg" if on else "bg", bold=on)) + 1
+            step = steps[S["step"]]
+            td = today()
+            if step == "wins":
+                self.tiles(3, [(str(d["done"]), "done in 7 days", "ok"), (str(d["prev"]), "the 7 days before", "dim"),
+                               (fmt_duration(d["time"]) if d["time"] else "0m", "time tracked", "accent2"),
+                               (str(d["streak"]), "day streak", "ok" if d["streak"] else "dim")])
+                rows = d["by_project"][:6]
+                self.put(7, 2, "by project", self.attr("accent", bold=True))
+                self.hbars(8, 2, min(W - 6, 60), [(k, v, str(v)) for k, v in rows], "accent2", 1.0)
+                y = 9 + max(1, len(rows))
+                self.put(y, 2, "finished", self.attr("accent", bold=True))
+                for r, (title, proj) in enumerate(d["titles"][:max(0, H - y - 3)]):
+                    self.put(y + 1 + r, 4, ("%s %s" % (self.sym["check_on"], title)) + ("  @" + proj if proj else ""),
+                             self.attr("done"), W - 6)
+            elif step == "reflect":
+                self.put(3, 2, "write the review into today's journal.", self.attr("accent", bold=True))
+                self.put(4, 2, "e writes it (you can edit the text first)   saved reviews: %s" % (self.state.get("last_review") or "never"),
+                         self.attr("dim"), W - 4)
+                preview = review_text(d, td).split("\n")
+                for r, ln in enumerate(preview[:max(0, H - 8)]):
+                    self.put(6 + r, 4, ln, self.attr("fg"), W - 6)
+            else:
+                lst = items(d)
+                blurb = {"slipped": "overdue. decide for each: do it, move it or drop it.",
+                         "stale": "open for a while with no due date and no recent changes. keep, snooze or drop.",
+                         "ahead": "due in the next 7 days. %s planned" % (fmt_duration(d["ahead_est"]) if d["ahead_est"] else "no estimates")}[step]
+                self.put(3, 2, "%d tasks: %s" % (len(lst), blurb), self.attr("accent", bold=True), W - 4)
+                room = max(1, H - 7)
+                S["i"] = max(0, min(S["i"], len(lst) - 1))
+                if S["i"] < S["top"]:
+                    S["top"] = S["i"]
+                if S["i"] >= S["top"] + room:
+                    S["top"] = S["i"] - room + 1
+                if not lst:
+                    self.put(5, 4, "nothing here. nice.", self.attr("ok"))
+                for r in range(room):
+                    k = S["top"] + r
+                    if k >= len(lst):
+                        break
+                    t = lst[k]
+                    on = k == S["i"]
+                    bg = "sel_bg" if on else "bg"
+                    self.fill(5 + r, 0, W, self.attr("fg", bg))
+                    due = t["due"] or "no date"
+                    role = "overdue" if (t["due"] and t["due"] < td.isoformat()) else "dim"
+                    x = self.put(5 + r, 2, pad(due, 10) + " ", self.attr(role, bg))
+                    extra = ("  @" + t["project"]) if t["project"] else ""
+                    age = "  %dd old" % d["age"].get(t["id"], 0) if step == "stale" else ""
+                    self.put(5 + r, x, t["title"] + extra + age, self.attr("fg", bg, bold=on), W - x - 2)
+            foot = "tab next step   shift-tab back   q close"
+            if step in ("slipped", "stale", "ahead"):
+                foot = "j/k  r reschedule  t tomorrow  w +1 week  s snooze 1w  x done  D drop   " + foot
+            self.screen_foot(H, W, foot)
+
+        def act(t, op):
+            td = today()
+            if op == "x":
+                with self.edit():
+                    self.complete(t, True)
+            elif op == "t":
+                with self.edit():
+                    t["due"] = (td + dt.timedelta(days=1)).isoformat()
+            elif op == "w":
+                with self.edit():
+                    t["due"] = (td + dt.timedelta(days=7)).isoformat()
+            elif op == "s":
+                with self.edit():
+                    t["snooze"] = (td + dt.timedelta(days=7)).isoformat()
+            elif op == "r":
+                text = self.prompt("new due date  (fri, +3d, 12-25, none)")
+                if not text:
+                    return
+                try:
+                    nd = parse_date(text.strip(), td)
+                except ValueError:
+                    self.say("could not read that date", "err")
+                    return
+                with self.edit():
+                    t["due"] = nd.isoformat() if nd else None
+            elif op == "D":
+                if self.confirm("delete: " + clip(t["title"], 40) + "?"):
+                    with self.edit():
+                        self.store.delete([t["id"]])
+
+        def handle(name, ch):
+            if name in ("q", "esc", "ctrl-c"):
+                return True
+            if name == "tab":
+                S["step"] = (S["step"] + 1) % len(steps)
+                S["i"] = S["top"] = 0
+                return False
+            if name == "shift-tab":
+                S["step"] = (S["step"] - 1) % len(steps)
+                S["i"] = S["top"] = 0
+                return False
+            if name in ("1", "2", "3", "4", "5"):
+                S["step"], S["i"], S["top"] = int(name) - 1, 0, 0
+                return False
+            d = self.review_data()
+            if steps[S["step"]] == "reflect":
+                if name in ("e", "enter"):
+                    td = today()
+                    text = self.edit_text("weekly review", review_text(d, td), footer="saved to today's journal")
+                    if text and text.strip():
+                        iso = td.isoformat()
+                        cur = self.store.journal.get(iso, "").rstrip()
+                        with self.edit():
+                            self.store.journal[iso] = (cur + "\n\n" if cur else "") + text.rstrip()
+                        self.state["last_review"] = iso
+                        self.persist("last_review", iso)
+                        self.say("review saved to the journal", "ok")
+                return False
+            lst = items(d)
+            if name in ("j", "down"):
+                S["i"] += 1
+            elif name in ("k", "up"):
+                S["i"] -= 1
+            elif name in ("x", "t", "w", "s", "r", "D") and lst:
+                S["i"] = max(0, min(S["i"], len(lst) - 1))
+                act(lst[S["i"]], name)
+            return False
+
+        self.screen_loop(render, handle)
 
     def momentum(self):
         key = (len(self.store.done_log), today().isoformat())
@@ -6690,7 +7667,7 @@ class App:
                 lock = " (required)" if items[i] in required else ""
                 self.put(y + 2 + r, x + 3, "[%s] %s%s" % ("v" if items[i] in on else " ", items[i], lock), a, w - 6)
             self.put(y + h - 2, x + 2, "space toggle  J K move  enter accept  esc cancel", self.attr("dim"), w - 4)
-            self.scr.refresh()
+            self.present()
             name, ch = self.read_key()
             if name in ("down", "j", "ctrl-n"):
                 idx = (idx + 1) % len(items)
@@ -6975,6 +7952,9 @@ class App:
             save_settings_file(self.settings_path, self.user_settings)
         self.open_in_editor(self.settings_path)
         self.sv_action_reload_files()
+
+    def sv_action_git_setup(self):
+        self.act_sync_setup()
 
     def sv_action_reload_files(self):
         self.cfg = load_config(self.cfg_path, lambda m: self.say(m, "err"), self.args.profile)
@@ -7351,7 +8331,7 @@ class App:
         try:
             while True:
                 render()
-                self.scr.refresh()
+                self.present()
                 name, ch = self.read_key()
                 if name in ("tick", "resize"):
                     continue
@@ -7513,6 +8493,8 @@ class App:
             "focus_mode": self.act_focus,
             "stats": self.act_stats,
             "changes": self.act_changes,
+            "git": self.act_git,
+            "review": self.act_review,
             "calendar": self.act_calendar,
             "note_add": self.act_note_add,
             "deps": self.act_deps,
@@ -7582,6 +8564,12 @@ class App:
             attrs[0] &= ~(termios.IXON | termios.IXOFF)
             termios.tcsetattr(fd, termios.TCSANOW, attrs)
         self.wake_check()
+        if self.opts.get("git_sync"):
+            self.startup_sync()
+        if self.opts.get("review_nudge", True) and self.store.tasks:
+            last = self.state.get("last_review") or ""
+            if not last or (today() - dt.date.fromisoformat(last)).days >= 7:
+                self.say("weekly review is due, press %s" % self.first_key("review"), "today", 8)
         start = self.opts.get("start_screen", "list")
         starters = {"journal": self.act_journal, "habits": self.act_habits, "projects": self.act_projects,
                     "stats": self.act_stats, "calendar": self.act_calendar,
@@ -7590,9 +8578,18 @@ class App:
             starters[start]()
         while self.running:
             self.wake_check()
+            self.git_apply()
             self.draw()
             name, _ = self.read_key()
             self.dispatch(name)
+            # a held key queues many events: apply them first and draw once
+            burst = 0
+            while self.running and burst < 16 and self.input_pending():
+                name, _ = self.read_key()
+                if name == "tick":
+                    break
+                self.dispatch(name)
+                burst += 1
 
 
 # ---------------------------------------------------------------------------
@@ -7662,7 +8659,10 @@ def main(argv=None):
         app = App(scr, cfg, store, state, cfg_path, args)
         for w in warnings:
             app.say(w, "err", 6)
-        app.run()
+        try:
+            app.run()
+        finally:
+            app.sync.finish()
 
     try:
         curses.wrapper(run)

@@ -98,6 +98,7 @@ Custom views in the sidebar use the same syntax.
 | `=` | custom actions and templates | `I` | switch detail tab (notes, info, links, history) |
 | `y` | copy task text | `alt-y` | duplicate task with subtasks |
 | `,` | settings panel | `W` | what changed (timeline of edits) |
+| `R` | weekly review | `ctrl-g` | git menu (TODOs, branches, commits, data sync) |
 
 Bulk actions (done, delete, priority, due, tags, project, repeat) apply to all selected tasks.
 Mouse: click selects, click the checkbox toggles, double click edits, wheel scrolls, click a view in the sidebar.
@@ -227,6 +228,39 @@ Widgets: `app`, `view`, `sort`, `query`, `selection`, `timer`, `progress`, `mome
 hide themselves, and ones that do not fit are skipped. `header_style` is `plain`, `divided` or `pills`.
 For the clock, `clock_12h` gives `3:07 PM` and `clock_seconds` adds seconds. `clock_format` (strftime) overrides both.
 
+## Weekly review (`R`)
+A five step screen (`tab` moves on, `1`-`5` jump): wins (done count against the week before, time tracked, by project),
+slipped (overdue), stale (open 3 weeks with no due date and no changes), ahead (due in the next 7 days, with the planned
+estimate) and reflect. On the list steps: `r` reschedule, `t` tomorrow, `w` next week, `s` snooze a week, `x` done, `D` drop.
+The last step writes the review into today's journal (`e`). synth reminds you on start when the last review is a week old
+(`review_nudge`).
+
+## Git
+Open the git menu with `ctrl-g` (or `:git`, `:todos`, `:sync`).
+
+**Project folders.** Give a project a folder with `path:` in the projects screen (`O`, then `e`) or from the git menu.
+
+**Find TODOs.** Scans a project folder (`git grep` inside a repo) for `TODO`, `FIXME`, `HACK` and `XXX` comments and lets you
+import them as tasks tagged `#todo`, with `file:line` in the notes. Already imported comments show as tracked. When a comment
+disappears from the code, `c` completes its task. Change the markers with `todo_markers`.
+
+**Link tasks to git.** From the git menu, link a branch (or create `synth/12-fix-thing` from the task title) or a commit. Linked
+tasks show a branch marker in the list and the branch, state and commits on the info tab. When the branch has new commits and
+is merged into the default branch, the task is completed (`git_auto_done`). Commit messages containing `synth:12` link the
+commit to task 12, and `closes synth:12`, `fixes synth:12` or `done synth:12` also complete it. Branches are checked in the
+background every `git_refresh` minutes.
+
+**Data in git.** With `git_sync = true` (or "Track data folder" in the git menu) the data folder becomes a git repository.
+Every change is committed a few seconds after the last edit with a message that lists what happened, for example
+`synth: 3 changes` followed by `- done #12 fix cutscenes`. `state.json` is ignored. Add a remote named `origin` in the data folder
+and turn on `git_push` to pull when synth starts and push after each commit. A rebase conflict is aborted and shown in the
+`sync` header widget instead of touching your data. Commit history is a full audit log you can browse with `git log`.
+
+## Flicker
+Each frame is sent to the terminal as one synchronized update (terminals that support it, such as kitty, foot, alacritty,
+wezterm and ghostty, never show half a frame), and keys that arrive together (a held `j`) are applied before a single redraw.
+If your terminal prints stray characters, set `sync_output = false`.
+
 ## Customizing in a file
 
 Almost everything is configurable, see the template for the full list. Highlights beyond keys, themes and views:
@@ -242,7 +276,7 @@ Almost everything is configurable, see the template for the full list. Highlight
 | shell actions | `[[actions]]` with a key, run in background, foreground or captured |
 | key chords | `quit = ["g q"]` style multi key sequences in `[keys]` |
 | wording | `[strings]` for the app name and prompts |
-| layout | `indent`, `border_style`, `header_*`, `sidebar_sections`, `sidebar_builtin`, `hints`, `mouse` |
+| layout | `indent`, `border_style`, `header_*`, `sync_output`, `sidebar_sections`, `sidebar_builtin`, `hints`, `mouse` |
 | theme inheritance | `inherit = "nord"` inside a custom theme |
 | start somewhere else | `start_screen = "journal"` (or habits, projects, stats, calendar, agenda) |
 | split configs | `include = ["work.toml"]` and `synth --profile work` (loads `config-work.toml`) |

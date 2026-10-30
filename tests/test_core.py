@@ -469,6 +469,82 @@ class SettingsPanelTests(unittest.TestCase):
         self.assertEqual(len(m["weeks"]), 8)
         self.assertEqual(synth.momentum_info([], td)["streak"], 0)
 
+    def test_todo_parsing(self):
+        self.assertEqual(synth.parse_todo_line("    # TODO: fix this later"), ("TODO", "fix this later"))
+        self.assertEqual(synth.parse_todo_line("x = 1  // FIXME(auth) handle nulls */"), ("FIXME", "handle nulls"))
+        self.assertIsNone(synth.parse_todo_line("# TODO"))
+        self.assertIsNone(synth.parse_todo_line("nothing here"))
+        refs = synth.parse_commit_refs("fixes synth:12 and touches synth:7", "")
+        self.assertEqual(refs, {12: True, 7: False})
+
+    def test_change_summary(self):
+        self.assertEqual(synth.change_summary([]), "synth: update")
+        self.assertEqual(synth.change_summary(["done #1 a"]), "synth: done #1 a")
+        msg = synth.change_summary(["done #1 a", "created #2 b"])
+        self.assertTrue(msg.startswith("synth: 2 changes\n\n- done #1 a"))
+
+    def test_git_scan_link_and_sync(self):
+        import shutil
+        import subprocess
+        if not shutil.which("git"):
+            self.skipTest("git not installed")
+        d = tempfile.mkdtemp()
+
+        def git(*a):
+            subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "init.defaultBranch=main"] + list(a),
+                           cwd=d, check=True, capture_output=True)
+        git("init", "-q")
+        with open(os.path.join(d, "a.py"), "w") as fh:
+            fh.write("x = 1\n# TODO: write docs\n# FIXME handle empty input\n")
+        git("add", "-A")
+        git("commit", "-q", "-m", "first")
+        found = synth.scan_todos(d)
+        self.assertEqual(sorted(f["kind"] for f in found), ["FIXME", "TODO"])
+        self.assertEqual(found[0]["file"], "a.py")
+        # branch probe: untouched, then committed, then merged
+        git("switch", "-q", "-c", "feat")
+        base = synth.git_rev(d, "refs/heads/feat")
+        job = {"id": 1, "repo": d, "branch": "feat", "base": base}
+        self.assertEqual(synth.git_probe(job), "active")
+        with open(os.path.join(d, "b.txt"), "w") as fh:
+            fh.write("b\n")
+        git("add", "-A")
+        git("commit", "-q", "-m", "work on synth:1")
+        self.assertEqual(synth.git_probe(job), "active")
+        git("switch", "-q", "main")
+        git("merge", "-q", "feat")
+        self.assertEqual(synth.git_probe(job), "merged")
+        self.assertEqual(synth.git_mentions(d)[0][2], {1: False})
+        # data sync commits
+        data = tempfile.mkdtemp()
+        sy = synth.DataSync(data)
+        self.assertTrue(sy.setup())
+        with open(os.path.join(data, "todos.json"), "w") as fh:
+            fh.write("{}")
+        sy.mark(["created #1 hello"], delay=0)
+        sy.finish()
+        rc, out = synth.git_run(["log", "--format=%s"], data)
+        self.assertIn("synth: created #1 hello", out)
+
+    def test_review_data(self):
+        st = synth.Store(os.path.join(tempfile.mkdtemp(), "t.json"))
+        td = dt.date(2026, 10, 30)
+        a = st.add("late")
+        a["due"] = "2026-10-20"
+        b = st.add("soon")
+        b["due"] = "2026-11-02"
+        c = st.add("old")
+        c["created"] = "2026-08-01T10:00:00"
+        e = st.add("finished")
+        e["done"] = True
+        st.done_log.append({"t": "2026-10-28T10:00:00", "id": e["id"], "p": "x", "n": "finished"})
+        d = synth.review_data(st, td)
+        self.assertEqual([t["title"] for t in d["slipped"]], ["late"])
+        self.assertEqual([t["title"] for t in d["ahead"]], ["soon"])
+        self.assertEqual([t["title"] for t in d["stale"]], ["old"])
+        self.assertEqual(d["done"], 1)
+        self.assertIn("## wins", synth.review_text(d, td))
+
 
 if __name__ == "__main__":
     unittest.main()
