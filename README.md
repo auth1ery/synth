@@ -98,7 +98,10 @@ Custom views in the sidebar use the same syntax.
 | `=` | custom actions and templates | `I` | switch detail tab (notes, info, links, history) |
 | `y` | copy task text | `alt-y` | duplicate task with subtasks |
 | `,` | settings panel | `W` | what changed (timeline of edits) |
-| `R` | weekly review | `ctrl-g` | git menu (TODOs, branches, commits, data sync) |
+| `R` | weekly review | `ctrl-g` | git menu (TODOs, branches, commits, GitHub, data sync) |
+| `.` | what now? | `m` | dependency graph (map) |
+| `M` | bulk edit the selection | `Q` | brain dump |
+| `ctrl-t` | time travel through data history | | |
 
 Bulk actions (done, delete, priority, due, tags, project, repeat) apply to all selected tasks.
 Mouse: click selects, click the checkbox toggles, double click edits, wheel scrolls, click a view in the sidebar.
@@ -260,6 +263,58 @@ and turn on `git_push` to pull when synth starts and push after each commit. A r
 Each frame is sent to the terminal as one synchronized update (terminals that support it, such as kitty, foot, alacritty,
 wezterm and ghostty, never show half a frame), and keys that arrive together (a held `j`) are applied before a single redraw.
 If your terminal prints stray characters, set `sync_output = false`.
+
+## Command-line capture
+Add tasks without opening the app, from fish or any script:
+
+```fish
+synth add "buy milk !2 tomorrow #home"
+synth add -p work -t inbox "write report by friday"
+pbpaste | synth add            # one task per line, indent for subtasks
+git log --oneline -5 | synth add -p ops
+```
+The usual quick-add syntax works, plus trailing phrases like `tomorrow`, `by friday`, `next week` and `in 3 days`. Piped text
+is read like a brain dump (below). Changes go into the history and, with `git_sync`, are committed right away.
+
+## Brain dump (`Q`)
+Paste notes, a meeting summary or a chat log. synth splits it into tasks, understands bullets, `[ ]` and `[x]` checkboxes,
+indentation for subtasks and `# Heading` lines (which set the project), then shows a checklist to review before anything is
+imported.
+
+## Bulk edit (`M`)
+Select tasks with `v` (or "select tasks matching a filter" inside the menu) and change their project, tags, due date, priority,
+snooze state, done state, or delete them in one go.
+
+## What now? (`.`)
+Tell it how much time you have and your energy (`m`, `e`) and it ranks what to do next from due dates, priority, what it
+unblocks, whether the estimate fits (scaled by your own estimate accuracy) and the project you are working in. With a
+calendar loaded, the time until your next event is filled in for you. `enter` starts tracking, `f` starts focus mode, `x`
+completes, `z` snoozes. Tag tasks `#quick`, `#easy` or `#admin` for low energy and `#deep` or `#focus` for high energy.
+
+## Dependency graph (`m`)
+A map of what blocks what, prerequisites on the left. The critical path (longest chain by estimate) is highlighted, `+N` shows
+how many tasks finishing a task eventually unblocks, and the biggest bottleneck is named at the top. `j`/`k` move within a
+column, `h`/`l` follow prerequisites and dependents, `enter` shows the task in the list, `d` includes finished tasks.
+
+## Time travel (`ctrl-t`)
+With the data folder tracked in git (`git_sync`), browse every saved version of your list. For the chosen version, see what was
+deleted since, what changed and what was added. `enter` restores a deleted task or puts a changed one back how it was,
+`a` restores every deleted task, and `R` replaces your whole list with that version (undo with `u`).
+
+## GitHub (git menu, `:issues`, `:prs`)
+Needs the GitHub CLI (`gh auth login`). Import your assigned issues or your open pull requests from a project folder, or link
+any issue or PR to an existing task. Linked tasks are completed automatically when the issue is closed or the PR is merged
+(`git_auto_done`). The issue or PR link is placed at the top of the notes so `L` opens it.
+
+## Calendar events
+Set `ics_sources` to the paths or URLs of `.ics` files (Google, Outlook and Apple calendars all export them, and `webcal://`
+works). Recurring events, all day events and time zones are understood. Events show in the calendar (`~` marks days) and the
+agenda, the `event` header widget shows what is next, and `i` in the calendar turns an event into a task with its duration as the
+estimate. Web calendars are cached in the data folder and refreshed every `ics_refresh` minutes.
+
+## Parking lot
+In focus mode press `p` to jot down whatever just came to mind. It lands in the inbox tagged `#parked`, with a note of what you
+were focusing on, and the focus screen counts what you parked so the thought cannot nag you.
 
 ## Customizing in a file
 

@@ -545,6 +545,147 @@ class SettingsPanelTests(unittest.TestCase):
         self.assertEqual(d["done"], 1)
         self.assertIn("## wins", synth.review_text(d, td))
 
+    def test_natural_due_and_dump(self):
+        td = dt.date(2026, 11, 1)
+        self.assertEqual(synth.natural_due("call mom tomorrow", td), ("call mom", "2026-11-02"))
+        self.assertEqual(synth.natural_due("ship it in 3 days", td), ("ship it", "2026-11-04"))
+        self.assertEqual(synth.natural_due("email bob by friday", td), ("email bob", "2026-11-06"))
+        self.assertEqual(synth.natural_due("buy tomorrow's milk", td), ("buy tomorrow's milk", None))
+        items = synth.parse_dump("# Work\n- plan release !2\n  - write notes\n  - [x] tag build\n- call dentist\n")
+        self.assertEqual([(i["title"], i["depth"], i["project"]) for i in items],
+                         [("plan release", 0, "Work"), ("write notes", 1, "Work"), ("tag build", 1, "Work"), ("call dentist", 0, "Work")])
+        self.assertTrue(items[2]["done"])
+        self.assertEqual(items[0]["prio"], 2)
+        st = synth.Store(os.path.join(tempfile.mkdtemp(), "t.json"))
+        made = synth.create_from_items(st, items, ["inbox"])
+        self.assertEqual(made[1]["parent"], made[0]["id"])
+        self.assertIsNone(made[3]["parent"])
+        self.assertIn("inbox", made[0]["tags"])
+
+    def test_cli_add(self):
+        import subprocess
+        d = tempfile.mkdtemp()
+        env = dict(os.environ, SYNTH_DATA=os.path.join(d, "todos.json"), SYNTH_CONFIG=os.path.join(d, "c.toml"))
+        script = os.path.join(os.path.dirname(os.path.abspath(synth.__file__)), "synth.py")
+        r = subprocess.run([sys.executable, script, "add", "buy milk !2 #home"], env=env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("added #1 buy milk", r.stdout)
+        r = subprocess.run([sys.executable, script, "add", "-p", "ops"], env=env, capture_output=True, text=True,
+                           input="- a\n  - b\n")
+        self.assertEqual(r.returncode, 0)
+        st = synth.Store(env["SYNTH_DATA"])
+        self.assertEqual([t["title"] for t in st.tasks], ["buy milk", "a", "b"])
+        self.assertEqual(st.tasks[2]["parent"], st.tasks[1]["id"])
+        self.assertEqual(st.tasks[1]["project"], "ops")
+        self.assertTrue(st.history)
+
+    def test_github_parse_and_fake_gh(self):
+        items = synth.parse_gh_items('[{"number": 4, "title": "Crash", "url": "u", "state": "OPEN", "labels": [{"name": "bug"}]}]', "issue")
+        self.assertEqual(items[0]["labels"], ["bug"])
+        self.assertEqual(items[0]["state"], "open")
+        self.assertEqual(synth.parse_gh_items("not json", "pr"), [])
+        self.assertTrue(synth.gh_done_state("issue", "closed"))
+        self.assertFalse(synth.gh_done_state("pr", "closed"))
+        self.assertTrue(synth.gh_done_state("pr", "merged"))
+        d = tempfile.mkdtemp()
+        fake = os.path.join(d, "gh")
+        with open(fake, "w") as fh:
+            fh.write('#!/bin/sh\necho \'[{"number": 9, "title": "Fix it", "url": "https://x/9", "state": "OPEN", "labels": []}]\'\n')
+        os.chmod(fake, 0o755)
+        old = os.environ["PATH"]
+        os.environ["PATH"] = d + os.pathsep + old
+        try:
+            got, err = synth.gh_list(d, "issue")
+        finally:
+            os.environ["PATH"] = old
+        self.assertEqual(err, "")
+        self.assertEqual(got[0]["number"], 9)
+
+    def test_ics(self):
+        ics = (
+            "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:a1\nSUMMARY:Standup\\, team\nDTSTART:20261102T160000\nDTEND:20261102T161500\n"
+            "RRULE:FREQ=WEEKLY;BYDAY=MO,WE;COUNT=4\nEXDATE:20261104T160000\nLOCATION:Zoom\nEND:VEVENT\n"
+            "BEGIN:VEVENT\nUID:b2\nSUMMARY:Holiday\nDTSTART;VALUE=DATE:20261111\nEND:VEVENT\n"
+            "BEGIN:VEVENT\nUID:c3\nSUMMARY:Review\nDTSTART:20261103T100000\nDURATION:PT1H\nRRULE:FREQ=MONTHLY;BYDAY=1TU\nEND:VEVENT\n"
+            "END:VCALENDAR\n")
+        ev = synth.parse_ics(ics)
+        self.assertEqual(len(ev), 3)
+        self.assertEqual(ev[0]["summary"], "Standup, team")
+        occ = synth.expand_events(ev, dt.date(2026, 11, 1), dt.date(2026, 12, 10))
+        stand = [o["start"].strftime("%m-%d") for o in occ if o["summary"].startswith("Standup")]
+        self.assertEqual(stand, ["11-02", "11-09", "11-11"])
+        self.assertEqual([o["start"].strftime("%m-%d") for o in occ if o["summary"] == "Review"], ["11-03", "12-01"])
+        hol = [o for o in occ if o["summary"] == "Holiday"][0]
+        self.assertTrue(hol["all_day"])
+        ongoing, nxt = synth.next_event(occ, dt.datetime(2026, 11, 2, 16, 5))
+        self.assertEqual(ongoing["summary"], "Standup, team")
+        self.assertEqual(nxt["summary"], "Review")
+
+    def test_whatnow_rank(self):
+        st = synth.Store(os.path.join(tempfile.mkdtemp(), "t.json"))
+        td = dt.date(2026, 11, 1)
+        a = st.add("overdue big")
+        a["due"] = "2026-10-28"
+        a["est"] = 7200
+        b = st.add("quick win")
+        b["est"] = 600
+        b["prio"] = 1
+        c = st.add("blocked")
+        c["deps"] = [b["id"]]
+        c["prio"] = 3
+        d = st.add("later")
+        d["snooze"] = "2026-12-01"
+        rank = synth.whatnow_rank(st, td, None, "medium")
+        self.assertEqual(rank[0][1]["title"], "overdue big")
+        self.assertNotIn("blocked", [r[1]["title"] for r in rank])
+        self.assertNotIn("later", [r[1]["title"] for r in rank])
+        short = synth.whatnow_rank(st, td, 30, "low")
+        self.assertEqual([r[1]["title"] for r in short], ["quick win"])
+
+    def test_dep_graph(self):
+        st = synth.Store(os.path.join(tempfile.mkdtemp(), "t.json"))
+        a, b, c, d = (st.add(n) for n in "abcd")
+        b["deps"] = [a["id"]]
+        c["deps"] = [b["id"], a["id"]]
+        d["deps"] = [c["id"]]
+        g = synth.dep_graph(st)
+        comp = g["comps"][0]
+        self.assertEqual(g["layers"], 4)
+        self.assertEqual(comp["nodes"][a["id"]]["layer"], 0)
+        self.assertEqual(comp["nodes"][d["id"]]["layer"], 3)
+        self.assertTrue(any(n["dummy"] for n in comp["nodes"].values()))
+        self.assertEqual(g["bott"], a["id"])
+        self.assertEqual(g["dependents"][a["id"]], 3)
+        self.assertIn(d["id"], g["crit"])
+        self.assertEqual(synth.dep_graph(synth.Store(os.path.join(tempfile.mkdtemp(), "x.json")))["comps"], [])
+
+    def test_time_travel(self):
+        import shutil
+        if not shutil.which("git"):
+            self.skipTest("git not installed")
+        data = tempfile.mkdtemp()
+        path = os.path.join(data, "todos.json")
+        st = synth.Store(path)
+        sy = synth.DataSync(data)
+        sy.setup()
+        st.on_save = lambda lines: sy.mark(lines, delay=0)
+        a = st.add("keep me")
+        b = st.add("delete me")
+        st.save()
+        sy.finish()
+        st.delete([b["id"]])
+        a["prio"] = 3
+        st.add("new one")
+        st.save()
+        sy.finish()
+        versions = synth.data_versions(data, "todos.json")
+        self.assertGreaterEqual(len(versions), 2)
+        old = synth.data_at(data, versions[1]["sha"], "todos.json")
+        diff = synth.version_diff(synth.filled_tasks(old), st)
+        self.assertEqual([t["title"] for t in diff["deleted"]], ["delete me"])
+        self.assertEqual([t["title"] for t in diff["added"]], ["new one"])
+        self.assertEqual(diff["changed"][0][2][0][0], "prio")
+
 
 if __name__ == "__main__":
     unittest.main()

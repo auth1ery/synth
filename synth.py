@@ -118,6 +118,11 @@ DEFAULT_KEYS = {
     "changes": ["W"],
     "git": ["ctrl-g"],
     "review": ["R"],
+    "bulk": ["M"],
+    "dump": ["Q"],
+    "whatnow": ["."],
+    "graph": ["m"],
+    "travel": ["ctrl-t"],
     "duplicate": ["alt-y"],
     "yank": ["y"],
     "settings": [","],
@@ -183,6 +188,11 @@ ACTION_DOC = {
     "changes": "what changed (timeline of edits)",
     "git": "git menu: TODOs, branches, commits, data sync",
     "review": "weekly review",
+    "bulk": "bulk edit the selection",
+    "dump": "brain dump: paste notes, review, import as tasks",
+    "whatnow": "what now? the best task for the time and energy you have",
+    "graph": "dependency graph (map)",
+    "travel": "time travel through your data history in git",
     "projects": "projects and goals",
     "template": "new task from a template",
     "actions_menu": "custom actions and templates",
@@ -235,6 +245,8 @@ DEFAULTS = {
     "header_habits": True,
     "header_momentum": True,
     "history": True,
+    "ics_sources": [],
+    "ics_refresh": 30,
     "sync_output": True,
     "git_sync": False,
     "git_push": False,
@@ -303,7 +315,7 @@ BOOL_OPTS = ["sync_output", "git_sync", "git_push", "git_auto_done", "review_nud
              "sidebar_counts", "mouse",
              "sidebar", "ascii", "transparent", "exact_colors", "animations", "show_done", "cascade_done",
              "confirm_delete", "focus_auto", "focus_bell"]
-INT_OPTS = ["git_commit_delay", "git_refresh", "indent", "sidebar_width", "detail_size", "scrolloff", "focus_work", "focus_break", "focus_long", "focus_rounds"]
+INT_OPTS = ["ics_refresh", "git_commit_delay", "git_refresh", "indent", "sidebar_width", "detail_size", "scrolloff", "focus_work", "focus_break", "focus_long", "focus_rounds"]
 FLOAT_OPTS = ["anim_speed"]
 
 UNICODE_SYMBOLS = {
@@ -522,6 +534,18 @@ CONFIG_TEMPLATE = """\
 # journal_template = "# {weekday}, {date}\\n\\n## Done\\n{done}\\n\\n## Notes\\n"
 #   variables: {date} {weekday} {done} {done_count} {time} {open} {overdue} {habits}
 # start_screen = "list"      # list, journal, habits, projects, stats, calendar, agenda
+
+# ---- git, calendars, review ----
+# git_sync = false           # commit the data folder to git after every change
+# git_push = false           # pull on start and push after commits (needs a remote named origin)
+# git_commit_delay = 5       # seconds to wait so a burst of edits becomes one commit
+# git_auto_done = true       # complete tasks when their branch is merged, PR merged or issue closed
+# git_refresh = 5            # minutes between checks of linked branches, commits and issues (0 = off)
+# todo_markers = ["TODO", "FIXME", "HACK", "XXX"]
+# ics_sources = ["~/calendar.ics", "https://example.com/me.ics"]   # calendar events
+# ics_refresh = 30           # minutes between downloads of web calendars
+# review_nudge = true        # remind you when the weekly review is a week old
+# sync_output = true         # draw frames as synchronized updates (less flicker)
 
 # ---- make it yours ----
 # indent = 2                 # spaces per subtask level
@@ -794,6 +818,158 @@ def serialize(t):
     return " ".join(parts)
 
 
+WEEKDAY_NAMES = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+NATURAL_DUE_RE = re.compile(
+    r"(?:\s+(?:by|on|before|due|until))?\s+(today|tonight|tomorrow|tmrw|next week|next (?:%s)|%s|in \d+ (?:day|days|week|weeks))\s*$"
+    % ("|".join(WEEKDAY_NAMES), "|".join(WEEKDAY_NAMES)), re.I)
+
+
+def natural_due(title, td=None):
+    """Split a trailing date phrase off a title. Returns (title, iso date or None)."""
+    td = td or today()
+    m = NATURAL_DUE_RE.search(title)
+    if not m or not title[:m.start()].strip():
+        return title, None
+    word = m.group(1).lower()
+    d = None
+    if word in ("today", "tonight"):
+        d = td
+    elif word in ("tomorrow", "tmrw"):
+        d = td + dt.timedelta(days=1)
+    elif word == "next week":
+        d = td + dt.timedelta(days=7 - td.weekday())
+    elif word.startswith("next "):
+        d = parse_date(word[5:][:3], td)
+        if d and d <= td + dt.timedelta(days=7 - td.weekday() - 1):
+            d += dt.timedelta(days=7)
+    elif word.startswith("in "):
+        n = int(word.split()[1])
+        d = td + dt.timedelta(days=n * (7 if word.endswith(("week", "weeks")) else 1))
+    else:
+        d = parse_date(word[:3], td)
+    if d is None:
+        return title, None
+    return title[:m.start()].rstrip(), d.isoformat()
+
+
+BULLET_RE = re.compile(r"^(?:[-*+•]\s+|\d+[.)]\s+)")
+CHECK_RE = re.compile(r"^\[([ xX])\]\s*")
+
+
+def parse_dump(text, project=""):
+    """Turn pasted notes into task items. One task per line; indentation makes subtasks;
+    markdown bullets and checkboxes are understood; '# Heading' sets the project."""
+    items, stack, heading = [], [], ""
+    for raw in text.replace("\t", "    ").split("\n"):
+        if not raw.strip():
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        line = raw.strip()
+        hm = re.match(r"^#{1,6}\s+(.+)$", line)
+        if hm:
+            heading = re.sub(r"\s+", "-", hm.group(1).strip().rstrip(":"))
+            stack = []
+            continue
+        line = BULLET_RE.sub("", line)
+        done = False
+        cm = CHECK_RE.match(line)
+        if cm:
+            done = cm.group(1) in "xX"
+            line = line[cm.end():]
+        p = parse_quick(line)
+        if p["due"] is UNSET:
+            p["title"], due = natural_due(p["title"])
+            if due:
+                p["due"] = due
+        if not p["title"]:
+            continue
+        while stack and stack[-1] >= indent:
+            stack.pop()
+        depth = len(stack)
+        stack.append(indent)
+        if not p["project"]:
+            p["project"] = heading or project
+        p["depth"], p["done"] = depth, done
+        items.append(p)
+    return items
+
+
+def apply_parsed_task(t, p, new):
+    if p["title"]:
+        t["title"] = p["title"]
+    t["tags"] = list(p["tags"])
+    t["project"] = p["project"]
+    t["prio"] = p["prio"]
+    t["repeat"] = p["repeat"]
+    t["est"] = p["est"]
+    if p.get("notes"):
+        t["notes"] = (t["notes"].rstrip() + "\n" if t["notes"].strip() else "") + p["notes"]
+    if p["due"] is not UNSET:
+        t["due"] = p["due"]
+    elif not new:
+        t["due"] = None
+
+
+def create_from_items(store, items, tags=None):
+    """Add parsed items to the store, keeping the nesting. Returns the new tasks."""
+    stack, out = [], []
+    for it in items:
+        while stack and stack[-1][0] >= it["depth"]:
+            stack.pop()
+        t = store.add(it["title"], parent=stack[-1][1]["id"] if stack else None)
+        apply_parsed_task(t, it, True)
+        for g in tags or []:
+            if g not in t["tags"]:
+                t["tags"].append(g)
+        if it.get("done"):
+            t["done"], t["done_at"] = True, now_iso()
+        stack.append((it["depth"], t))
+        out.append(t)
+    return out
+
+
+def cli_add(argv):
+    ap = argparse.ArgumentParser(prog="synth add", description="add tasks without opening the app. Reads stdin when piped.")
+    ap.add_argument("text", nargs="*", help="task text with the usual syntax (#tag @project !2 due:fri), or - for stdin")
+    ap.add_argument("-p", "--project", default="", help="project for tasks that have none")
+    ap.add_argument("-t", "--tag", action="append", default=[], help="tag to add (repeatable)")
+    ap.add_argument("-q", "--quiet", action="store_true", help="print nothing")
+    ap.add_argument("--data", help="path to the todos json file")
+    ap.add_argument("--config", help="path to the config toml")
+    ap.add_argument("--profile", help="also load config-NAME.toml")
+    a = ap.parse_args(argv)
+    text = " ".join(a.text)
+    if a.text == ["-"] or (not text.strip() and not sys.stdin.isatty()):
+        text = sys.stdin.read()
+    if not text.strip():
+        sys.stderr.write("synth add: nothing to add\n")
+        return 1
+    items = parse_dump(text, a.project)
+    if not items:
+        sys.stderr.write("synth add: nothing to add\n")
+        return 1
+    cfg_path = a.config or os.environ.get("SYNTH_CONFIG") or CONFIG_PATH
+    store = Store(a.data or os.environ.get("SYNTH_DATA") or DATA_PATH)
+    opts = load_config(cfg_path, lambda w: sys.stderr.write(w + "\n"), a.profile)
+    sp = os.path.join(os.path.dirname(cfg_path), "settings%s.json" % (("-" + a.profile) if a.profile else ""))
+    for k, v in load_settings(sp).items():
+        if k in DEFAULTS:
+            opts[k] = v
+    sy = DataSync(os.path.dirname(store.path))
+    if opts.get("git_sync") and sy.enabled():
+        sy.push = bool(opts.get("git_push"))
+        store.on_save = lambda lines: sy.mark(lines, delay=0)
+    before = {t["id"]: task_sig(t) for t in store.tasks}
+    made = create_from_items(store, items, [g.lower().lstrip("#") for g in a.tag])
+    store.record_changes(before)
+    store.save()
+    sy.finish()
+    if not a.quiet:
+        for t in made:
+            print("added #%d %s" % (t["id"], t["title"]))
+    return 0
+
+
 def compile_query(text, store=None):
     """Return predicate(task, today) for query text. All terms must match."""
     preds = []
@@ -903,7 +1079,7 @@ def blank_task(tid, title):
         "id": tid, "title": title, "done": False, "prio": 0, "due": None, "tags": [],
         "project": "", "notes": "", "created": now_iso(), "done_at": None,
         "parent": None, "folded": False, "repeat": "", "est": 0,
-        "deps": [], "snooze": "", "git": {}, "src": {},
+        "deps": [], "snooze": "", "git": {}, "src": {}, "gh": {},
     }
 
 
@@ -1635,6 +1811,573 @@ def git_probe(job):
     return "active"
 
 
+def gh_run(args, cwd, timeout=25):
+    """Run the GitHub CLI. Returns (returncode, text). 127 when gh is missing."""
+    if not shutil.which("gh"):
+        return 127, "the GitHub CLI (gh) is not installed"
+    try:
+        r = subprocess.run(["gh"] + list(args), cwd=cwd, capture_output=True, text=True, errors="replace",
+                           timeout=timeout, env=dict(os.environ, GH_PROMPT_DISABLED="1", NO_COLOR="1"))
+    except (OSError, subprocess.SubprocessError):
+        return 127, "could not run gh"
+    return r.returncode, (r.stdout if r.returncode == 0 else (r.stderr or r.stdout))
+
+
+def parse_gh_items(text, kind):
+    """Normalize gh --json output. Returns [{number, title, url, state, kind, labels, draft}]."""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return []
+    out = []
+    for d in data if isinstance(data, list) else []:
+        if not isinstance(d, dict) or "number" not in d:
+            continue
+        labels = [l.get("name", "") if isinstance(l, dict) else str(l) for l in d.get("labels") or []]
+        out.append({"number": int(d["number"]), "title": str(d.get("title", "")), "url": str(d.get("url", "")),
+                    "state": str(d.get("state", "OPEN")).lower(), "kind": kind, "labels": [x for x in labels if x],
+                    "draft": bool(d.get("isDraft", False))})
+    return out
+
+
+def gh_list(cwd, kind, mine=True, state="open", limit=100):
+    """List issues or pull requests of the repo in cwd. Returns (items, error text)."""
+    cmd = "issue" if kind == "issue" else "pr"
+    fields = "number,title,url,state,labels" + (",isDraft" if kind == "pr" else "")
+    args = [cmd, "list", "--state", state, "--limit", str(limit), "--json", fields]
+    if mine:
+        args += ["--assignee", "@me"] if kind == "issue" else ["--author", "@me"]
+    rc, out = gh_run(args, cwd)
+    if rc != 0:
+        return [], out.strip().split("\n")[-1][:100]
+    return parse_gh_items(out, kind), ""
+
+
+def gh_done_state(kind, state):
+    """True when a linked issue or PR counts as finished."""
+    return state == "merged" if kind == "pr" else state in ("closed", "merged")
+
+
+try:
+    import zoneinfo
+except ImportError:
+    zoneinfo = None
+
+ICS_DAYS = {"MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6}
+
+
+def ics_unfold(text):
+    out = []
+    for ln in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if ln[:1] in (" ", "\t") and out:
+            out[-1] += ln[1:]
+        else:
+            out.append(ln)
+    return out
+
+
+def ics_unescape(v):
+    return v.replace("\\n", "\n").replace("\\N", "\n").replace("\\,", ",").replace("\\;", ";").replace("\\\\", "\\")
+
+
+def ics_prop(line):
+    """Split 'NAME;P=V:value' into (name, params dict, value)."""
+    if ":" not in line:
+        return None
+    head, _, value = line.partition(":")
+    parts = head.split(";")
+    params = {}
+    for p in parts[1:]:
+        k, _, v = p.partition("=")
+        params[k.upper()] = v.strip('"')
+    return parts[0].upper(), params, value
+
+
+def ics_datetime(value, params):
+    """Return (naive local datetime, all_day) or (None, False)."""
+    value = value.strip()
+    try:
+        if params.get("VALUE") == "DATE" or (len(value) == 8 and value.isdigit()):
+            return dt.datetime.strptime(value[:8], "%Y%m%d"), True
+        if value.endswith("Z"):
+            d = dt.datetime.strptime(value, "%Y%m%dT%H%M%SZ").replace(tzinfo=dt.timezone.utc)
+            return d.astimezone().replace(tzinfo=None), False
+        d = dt.datetime.strptime(value[:15], "%Y%m%dT%H%M%S")
+    except ValueError:
+        return None, False
+    tzid = params.get("TZID")
+    if tzid and zoneinfo is not None:
+        try:
+            return d.replace(tzinfo=zoneinfo.ZoneInfo(tzid)).astimezone().replace(tzinfo=None), False
+        except (KeyError, ValueError, OSError):
+            pass
+    return d, False
+
+
+def ics_duration(v):
+    m = re.fullmatch(r"([+-])?P(?:(\d+)W)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?", v.strip())
+    if not m:
+        return None
+    sign = -1 if m.group(1) == "-" else 1
+    w, d, h, mi, s = (int(x or 0) for x in m.groups()[1:])
+    return sign * dt.timedelta(weeks=w, days=d, hours=h, minutes=mi, seconds=s)
+
+
+def parse_ics(text):
+    """Parse VEVENTs. Returns a list of event dicts (recurrence rules are kept, not expanded)."""
+    events, cur = [], None
+    for line in ics_unfold(text):
+        up = line.strip().upper()
+        if up == "BEGIN:VEVENT":
+            cur = {"uid": "", "summary": "", "location": "", "start": None, "end": None, "all_day": False,
+                   "rrule": None, "exdates": set(), "rid": None, "dur": None, "status": ""}
+            continue
+        if up == "END:VEVENT":
+            if cur and cur["start"] is not None and cur["status"] != "CANCELLED":
+                if cur["end"] is None:
+                    cur["end"] = cur["start"] + (cur["dur"] or (dt.timedelta(days=1) if cur["all_day"] else dt.timedelta()))
+                events.append(cur)
+            cur = None
+            continue
+        if cur is None:
+            continue
+        pr = ics_prop(line)
+        if not pr:
+            continue
+        name, params, value = pr
+        if name == "UID":
+            cur["uid"] = value.strip()
+        elif name == "SUMMARY":
+            cur["summary"] = ics_unescape(value).strip()
+        elif name == "LOCATION":
+            cur["location"] = ics_unescape(value).strip()
+        elif name == "STATUS":
+            cur["status"] = value.strip().upper()
+        elif name == "DTSTART":
+            cur["start"], cur["all_day"] = ics_datetime(value, params)
+        elif name == "DTEND":
+            cur["end"], _ = ics_datetime(value, params)
+        elif name == "DURATION":
+            cur["dur"] = ics_duration(value)
+        elif name == "RECURRENCE-ID":
+            cur["rid"], _ = ics_datetime(value, params)
+        elif name == "EXDATE":
+            for v in value.split(","):
+                d, _ = ics_datetime(v, params)
+                if d is not None:
+                    cur["exdates"].add(d)
+        elif name == "RRULE":
+            rule = {}
+            for part in value.split(";"):
+                k, _, v = part.partition("=")
+                rule[k.upper()] = v
+            cur["rrule"] = rule
+    return events
+
+
+def _nth_weekday(year, month, weekday, n):
+    """n-th weekday of a month (n=-1 is the last). Returns a date or None."""
+    if n > 0:
+        first = dt.date(year, month, 1)
+        d = first + dt.timedelta(days=(weekday - first.weekday()) % 7 + 7 * (n - 1))
+        return d if d.month == month else None
+    last = add_months(dt.date(year, month, 1), 1) - dt.timedelta(days=1)
+    d = last - dt.timedelta(days=(last.weekday() - weekday) % 7 + 7 * (-n - 1))
+    return d if d.month == month else None
+
+
+def rrule_dates(start, rule, limit):
+    """Yield occurrence start datetimes of a recurrence rule until limit (a datetime)."""
+    freq = rule.get("FREQ", "")
+    interval = max(1, int(rule.get("INTERVAL", "1") or 1))
+    count = int(rule["COUNT"]) if rule.get("COUNT", "").isdigit() else None
+    until = None
+    if rule.get("UNTIL"):
+        until, _ = ics_datetime(rule["UNTIL"], {})
+        if until is not None and len(rule["UNTIL"]) == 8:
+            until += dt.timedelta(days=1) - dt.timedelta(seconds=1)
+    byday = []
+    for tok in rule.get("BYDAY", "").split(","):
+        m = re.fullmatch(r"([+-]?\d+)?(MO|TU|WE|TH|FR|SA|SU)", tok.strip())
+        if m:
+            byday.append((int(m.group(1)) if m.group(1) else 0, ICS_DAYS[m.group(2)]))
+    bymd = [int(x) for x in rule.get("BYMONTHDAY", "").split(",") if re.fullmatch(r"-?\d+", x.strip())]
+    tm = start.time()
+    emitted = 0
+    for k in range(0, 6000):
+        cands = []
+        if freq == "DAILY":
+            cands = [start.date() + dt.timedelta(days=k * interval)]
+        elif freq == "WEEKLY":
+            monday = start.date() - dt.timedelta(days=start.weekday()) + dt.timedelta(weeks=k * interval)
+            days = sorted({d for _, d in byday}) or [start.weekday()]
+            cands = [monday + dt.timedelta(days=d) for d in days]
+        elif freq == "MONTHLY":
+            base = add_months(start.date().replace(day=1), k * interval)
+            if byday:
+                cands = [x for x in (_nth_weekday(base.year, base.month, wd, n or 1) for n, wd in byday) if x]
+            else:
+                for md in bymd or [start.day]:
+                    last = add_months(base, 1) - dt.timedelta(days=1)
+                    day = md if md > 0 else last.day + md + 1
+                    if 1 <= day <= last.day:
+                        cands.append(base.replace(day=day))
+            cands.sort()
+        elif freq == "YEARLY":
+            try:
+                cands = [start.date().replace(year=start.year + k * interval)]
+            except ValueError:
+                cands = []
+        else:
+            return
+        for d in cands:
+            occ = dt.datetime.combine(d, tm)
+            if occ < start:
+                continue
+            if until is not None and occ > until:
+                return
+            if occ > limit:
+                return
+            yield occ
+            emitted += 1
+            if count is not None and emitted >= count:
+                return
+
+
+def expand_events(events, d0, d1):
+    """Occurrences overlapping [d0, d1] (dates), sorted. Each: summary start end all_day location uid."""
+    lo = dt.datetime.combine(d0, dt.time())
+    hi = dt.datetime.combine(d1, dt.time()) + dt.timedelta(days=1)
+    overrides = {(e["uid"], e["rid"]) for e in events if e["rid"] is not None}
+    out = []
+
+    def add(e, start):
+        end = start + (e["end"] - e["start"])
+        if end > lo and start < hi:
+            out.append({"summary": e["summary"] or "(no title)", "start": start, "end": end, "all_day": e["all_day"],
+                        "location": e["location"], "uid": e["uid"]})
+
+    for e in events:
+        if e["rrule"] and e["rid"] is None:
+            for occ in rrule_dates(e["start"], e["rrule"], hi):
+                if occ in e["exdates"] or (e["uid"], occ) in overrides:
+                    continue
+                add(e, occ)
+        else:
+            add(e, e["start"])
+    out.sort(key=lambda o: (o["start"], o["summary"]))
+    return out
+
+
+def next_event(occ, now):
+    """(ongoing occurrence or None, next timed occurrence or None) at time now."""
+    ongoing = nxt = None
+    for o in occ:
+        if o["all_day"]:
+            continue
+        if o["start"] <= now < o["end"]:
+            ongoing = ongoing or o
+        elif o["start"] > now:
+            nxt = o
+            break
+    return ongoing, nxt
+
+
+ENERGY_LEVELS = ["low", "medium", "high"]
+LOW_TAGS = {"quick", "easy", "admin", "chore", "low-energy"}
+HIGH_TAGS = {"deep", "focus", "hard", "creative", "high-energy"}
+
+
+def whatnow_rank(store, td, minutes=None, energy="medium", median=1.0, project=""):
+    """Rank open tasks for right now. Returns [(score, task, reasons)] best first.
+
+    minutes is the time available (None for unknown), energy is low, medium or high,
+    median scales estimates by how long your tasks really take."""
+    waiting = collections.Counter()
+    open_parents = set()
+    for t in store.tasks:
+        if t["done"]:
+            continue
+        for d in t.get("deps", []):
+            waiting[d] += 1
+        if t["parent"] is not None:
+            open_parents.add(t["parent"])
+    out = []
+    for t in store.tasks:
+        if t["done"] or is_snoozed(t, td) or blockers(store, t) or t["id"] in open_parents:
+            continue
+        est = t.get("est", 0) or 0
+        adj = est * (median if median and est else 1.0)
+        if minutes is not None and adj > minutes * 60 * 1.1:
+            continue
+        score, why = 0.0, []
+        if t["prio"]:
+            score += 2.0 * t["prio"]
+            why.append({1: "low priority", 2: "medium priority", 3: "high priority"}.get(t["prio"], "priority"))
+        if t["due"]:
+            days = (dt.date.fromisoformat(t["due"]) - td).days
+            if days < 0:
+                score += 6 + min(4.0, -days * 0.4)
+                why.append("overdue %dd" % -days)
+            elif days == 0:
+                score += 5
+                why.append("due today")
+            elif days == 1:
+                score += 3
+                why.append("due tomorrow")
+            elif days <= 7:
+                score += 1.5
+                why.append("due in %dd" % days)
+        n = waiting.get(t["id"], 0)
+        if n:
+            score += 1.5 * min(3, n)
+            why.append("unblocks %d" % n)
+        try:
+            age = (td - dt.date.fromisoformat(t["created"][:10])).days
+        except ValueError:
+            age = 0
+        if age >= 30:
+            score += 0.5
+        if minutes is not None and est:
+            ratio = min(1.1, adj / (minutes * 60.0))
+            score += 1.5 * ratio
+            why.append("fits in %s" % fmt_duration(int(adj)))
+        elif est:
+            why.append("about %s" % fmt_duration(int(adj)))
+        tags = set(t["tags"])
+        short = bool(est) and adj <= 1200
+        if energy == "low":
+            if short or tags & LOW_TAGS:
+                score += 2.0
+                why.append("easy on low energy")
+            if t["prio"] >= 3 and not short:
+                score -= 1.0
+            if tags & HIGH_TAGS:
+                score -= 2.0
+        elif energy == "high":
+            if tags & HIGH_TAGS or (t["prio"] >= 2 and (adj >= 1800 or not est)):
+                score += 2.0
+                why.append("worth your best energy")
+            if tags & LOW_TAGS:
+                score -= 1.0
+        if project and t["project"] == project:
+            score += 1.0
+            why.append("same project as your current work")
+        out.append((score, t, why))
+    out.sort(key=lambda r: (-r[0], r[1]["due"] or "9999", -r[1]["prio"], r[1]["created"]))
+    return out
+
+
+def dep_graph(store, show_done=False):
+    """Layered layout of the dependency graph. Prerequisites sit left of what they unblock.
+
+    Returns {"comps": [{"nodes": {key: {layer, y, dummy}}, "edges": [(a, b)]}], "crit": set of ids,
+    "crit_edges": set of (a, b), "dependents": {id: transitive count}, "bott": id or None, "layers": n,
+    "crit_secs": seconds, "height": rows}. Real nodes are task ids, long edges pass through dummy keys."""
+    tasks = {t["id"]: t for t in store.tasks}
+    inc = set()
+    for t in store.tasks:
+        if t["done"]:
+            continue
+        ds = [d for d in t.get("deps", []) if d in tasks and (show_done or not tasks[d]["done"])]
+        if ds:
+            inc.add(t["id"])
+            inc.update(ds)
+    res = {"comps": [], "crit": set(), "crit_edges": set(), "dependents": {}, "bott": None, "layers": 0,
+           "crit_secs": 0, "height": 0}
+    if not inc:
+        return res
+    order = [t["id"] for t in store.tasks if t["id"] in inc]
+    preds = {i: [d for d in tasks[i].get("deps", []) if d in inc and d != i] for i in order}
+    succs = {i: [] for i in order}
+    for b, ps in preds.items():
+        for a in ps:
+            succs[a].append(b)
+    layer, left = {}, set(order)
+    indeg = {i: len(preds[i]) for i in order}
+    queue = [i for i in order if indeg[i] == 0]
+    while queue:
+        i = queue.pop(0)
+        layer[i] = 1 + max([layer[p] for p in preds[i] if p in layer] or [-1])
+        left.discard(i)
+        for b in succs[i]:
+            indeg[b] -= 1
+            if indeg[b] == 0:
+                queue.append(b)
+    for i in left:
+        layer[i] = 0
+    edges = [(a, b) for b in order for a in preds[b] if layer[a] < layer[b]]
+    # critical path: longest chain by estimate (30 minutes when unknown)
+    w = {i: (tasks[i].get("est") or 1800) for i in order}
+    best, prev = {}, {}
+    for i in sorted(order, key=lambda x: layer[x]):
+        cand = [(best[p], p) for p in preds[i] if p in best and layer[p] < layer[i]]
+        top = max(cand) if cand else (0, None)
+        best[i] = top[0] + w[i]
+        prev[i] = top[1]
+    end = max(order, key=lambda x: best[x])
+    chain = []
+    cur = end
+    while cur is not None:
+        chain.append(cur)
+        cur = prev[cur]
+    res["crit"] = set(chain)
+    res["crit_edges"] = {(chain[k + 1], chain[k]) for k in range(len(chain) - 1)}
+    res["crit_secs"] = best[end]
+    # transitive dependents
+    for i in order:
+        seen, stack = set(), list(succs[i])
+        while stack:
+            x = stack.pop()
+            if x not in seen:
+                seen.add(x)
+                stack.extend(succs[x])
+        res["dependents"][i] = len(seen)
+    top_n = max(res["dependents"].values())
+    if top_n > 0:
+        res["bott"] = max(order, key=lambda x: (res["dependents"][x], -layer[x]))
+    # components
+    parent = {i: i for i in order}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    for a, b in edges:
+        parent[find(a)] = find(b)
+    groups = collections.OrderedDict()
+    for i in order:
+        groups.setdefault(find(i), []).append(i)
+    y_base, layers_max = 0, 0
+    for members in sorted(groups.values(), key=lambda m: -len(m)):
+        ms = set(members)
+        nodes = {i: {"layer": layer[i], "y": 0, "dummy": False} for i in members}
+        cedges = []
+        for a, b in edges:
+            if a not in ms:
+                continue
+            chain_keys = [a] + [("v", a, b, l) for l in range(layer[a] + 1, layer[b])] + [b]
+            for k in chain_keys[1:-1]:
+                nodes[k] = {"layer": k[3], "y": 0, "dummy": True}
+            for k in range(len(chain_keys) - 1):
+                cedges.append((chain_keys[k], chain_keys[k + 1], (a, b)))
+        nl = max(n["layer"] for n in nodes.values()) + 1
+        lays = [[] for _ in range(nl)]
+        idx = {i: n for n, i in enumerate(order)}
+        for k in sorted(nodes, key=lambda k: (idx[k] if not isinstance(k, tuple) else idx[k[1]] + 0.5)):
+            lays[nodes[k]["layer"]].append(k)
+        pin = collections.defaultdict(list)
+        pout = collections.defaultdict(list)
+        for a, b, _o in cedges:
+            pin[b].append(a)
+            pout[a].append(b)
+        pos = {k: n for lay in lays for n, k in enumerate(lay)}
+        for sweep in range(4):
+            rng = range(1, nl) if sweep % 2 == 0 else range(nl - 2, -1, -1)
+            for l in rng:
+                nb = pin if sweep % 2 == 0 else pout
+                lays[l].sort(key=lambda k: (sum(pos[x] for x in nb[k]) / float(len(nb[k])) if nb[k] else pos[k], pos[k]))
+                for n, k in enumerate(lays[l]):
+                    pos[k] = n
+        for l in range(nl):
+            last = -2
+            for k in lays[l]:
+                want = [nodes[x]["y"] for x in pin[k]] if l > 0 else []
+                y = int(round(sum(want) / float(len(want)))) if want else last + 2
+                if y % 2:
+                    y += 1
+                y = max(y, last + 2)
+                nodes[k]["y"] = y
+                last = y
+        h = max(n["y"] for n in nodes.values()) + 1
+        for n in nodes.values():
+            n["y"] += y_base
+        res["comps"].append({"nodes": nodes, "edges": cedges, "y0": y_base, "height": h})
+        y_base += h + 2
+        layers_max = max(layers_max, nl)
+    res["layers"] = layers_max
+    res["height"] = y_base
+    return res
+
+
+GRAPH_BITS = {"L": 1, "R": 2, "U": 4, "D": 8}
+GRAPH_CHARS = {1: "─", 2: "─", 3: "─", 4: "│", 8: "│", 12: "│", 10: "┌", 9: "┐", 6: "└", 5: "┘",
+               11: "┬", 7: "┴", 14: "├", 13: "┤", 15: "┼"}
+GRAPH_ASCII = {k: ("-" if k in (1, 2, 3) else "|" if k in (4, 8, 12) else "+") for k in GRAPH_CHARS}
+
+
+def graph_route(cells, x0, y0, x1, y1, xm, crit):
+    """Draw an orthogonal edge into a cell map: right to xm, vertical to y1, right to x1."""
+    pts = [(x0, y0), (xm, y0), (xm, y1), (x1, y1)]
+    for (ax, ay), (bx, by) in zip(pts, pts[1:]):
+        dx = (bx > ax) - (bx < ax)
+        dy = (by > ay) - (by < ay)
+        x, y = ax, ay
+        while (x, y) != (bx, by):
+            nx, ny = x + dx, y + dy
+            for (cx, cy, bit) in ((x, y, GRAPH_BITS["R"] if dx > 0 else GRAPH_BITS["L"] if dx < 0 else GRAPH_BITS["D"] if dy > 0 else GRAPH_BITS["U"]),
+                                  (nx, ny, GRAPH_BITS["L"] if dx > 0 else GRAPH_BITS["R"] if dx < 0 else GRAPH_BITS["U"] if dy > 0 else GRAPH_BITS["D"])):
+                m, c = cells.get((cx, cy), (0, False))
+                cells[(cx, cy)] = (m | bit, c or crit)
+            x, y = nx, ny
+
+
+def data_versions(directory, fname, limit=200):
+    """Commits that touched the data file. Returns [{sha, when, subject}], newest first."""
+    rc, out = git_run(["log", "-n", str(limit), "--format=%H%x1f%aI%x1f%s", "--", fname], directory, timeout=20)
+    rows = []
+    for ln in out.split("\n") if rc == 0 else []:
+        parts = ln.split("\x1f")
+        if len(parts) == 3 and parts[0]:
+            rows.append({"sha": parts[0], "when": parts[1], "subject": parts[2]})
+    return rows
+
+
+def data_at(directory, sha, fname):
+    """The data file as it was in a commit, or None."""
+    rc, out = git_run(["show", "%s:%s" % (sha, fname)], directory, timeout=20)
+    if rc != 0:
+        return None
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def filled_tasks(data):
+    """Tasks of a stored version with every field present."""
+    out = []
+    for raw in data.get("tasks", []):
+        t = blank_task(raw.get("id", 0), "")
+        t.update(raw)
+        out.append(t)
+    return out
+
+
+def version_diff(old_tasks, store):
+    """Compare an old version with the live store.
+
+    Returns {"deleted": [old task], "changed": [(old task, now task, [(kind, text)])], "added": [now task]}."""
+    now = {t["id"]: t for t in store.tasks}
+    then = {t["id"]: t for t in old_tasks}
+    deleted = [t for t in old_tasks if t["id"] not in now]
+    added = [t for t in store.tasks if t["id"] not in then]
+    changed = []
+    for t in old_tasks:
+        cur = now.get(t["id"])
+        if cur is None:
+            continue
+        d = diff_sig(task_sig(t), cur)
+        if d:
+            changed.append((t, cur, d))
+    return {"deleted": deleted, "changed": changed, "added": added}
+
+
+RESTORE_FIELDS = ["title", "done", "done_at", "prio", "due", "tags", "project", "notes", "repeat", "est", "deps", "snooze"]
+
+
 def change_summary(lines):
     """Commit message for a batch of change lines."""
     lines = [x for x in lines if x]
@@ -1677,8 +2420,9 @@ class DataSync:
         if not os.path.exists(ig):
             with open(ig, "w", encoding="utf-8") as fh:
                 fh.write(self.IGNORE)
-        self.status = "pending"
         self.commit("synth: start tracking data")
+        if self.status != "error":
+            self.status = "synced"
         return True
 
     def has_remote(self):
@@ -2421,7 +3165,7 @@ HOOK_EVENTS = {
 STRING_KEYS = {"app_name": "Name shown in the header.", "empty": "Text for an empty list.",
                "add_title": "Title of the add task prompt."}
 HEADER_WIDGETS = ["app", "view", "sort", "query", "selection", "timer", "progress", "momentum", "habits", "clock",
-                  "date", "open", "overdue", "due_today", "greeting", "week", "text", "sync"]
+                  "date", "open", "overdue", "due_today", "greeting", "week", "text", "sync", "event"]
 COLUMN_CHOICES = ["check", "prio", "id", "title", "est", "tags", "project", "time", "due", "deps", "snooze", "created"]
 SCREEN_CHOICES = ["list", "journal", "habits", "projects", "stats", "calendar", "agenda"]
 ROLE_DOC = {
@@ -2561,6 +3305,10 @@ def build_settings_tree():
         _s("todo_markers", "TODO Markers", "strlist", "Comment markers the TODO scanner looks for, comma separated."),
         _s(None, "Track Data Folder Now", "action", "Run git init in the data folder and start committing.", run="git_setup", button="Set up"),
     ]
+    calendar = [
+        _s("ics_sources", "Calendar Files", "strlist", "Paths or URLs of .ics calendars (webcal:// works). Events show in the calendar and agenda, the event widget and What Now."),
+        _s("ics_refresh", "Refresh Every (minutes)", "int", "How often web calendars are downloaded again.", min=1, max=1440),
+    ]
     review = [
         _s("review_nudge", "Review Reminder", "bool", "Remind you on start when the last weekly review is a week old."),
     ]
@@ -2601,6 +3349,7 @@ def build_settings_tree():
         _node("Focus", focus),
         _node("Git", gitset),
         _node("Weekly Review", review),
+        _node("Calendar Events", calendar),
         _node("Keybindings", dyn="keys", blurb="Comma separated keys. Chords like g g work. Type none to unbind."),
         _node("Views and Sorts", views),
         _node("Styling Rules", rules),
@@ -2703,6 +3452,8 @@ class App:
         self.git_results = []
         self.git_next = time.time() + 3
         self.git_force = False
+        self.ics_raw, self.ics_occ, self.ics_loaded = [], [], None
+        self.ics_day, self.ics_started, self.ics_next, self.ics_thread = "", False, 0.0, None
         store.on_save = self.on_store_save
         self.anims = {}
         self.bar_disp = 0.0
@@ -3106,19 +3857,7 @@ class App:
         self.say(note or ("done" if make_done else "reopened"), "ok")
 
     def apply_parsed(self, t, p, new):
-        if p["title"]:
-            t["title"] = p["title"]
-        t["tags"] = p["tags"]
-        t["project"] = p["project"]
-        t["prio"] = p["prio"]
-        t["repeat"] = p["repeat"]
-        t["est"] = p["est"]
-        if p.get("notes"):
-            t["notes"] = (t["notes"].rstrip() + "\n" if t["notes"].strip() else "") + p["notes"]
-        if p["due"] is not UNSET:
-            t["due"] = p["due"]
-        elif not new:
-            t["due"] = None
+        apply_parsed_task(t, p, new)
 
     def add_defaults(self, t):
         v = self.view
@@ -3377,8 +4116,8 @@ class App:
 
     # ----- palette -----
 
-    COMMANDS = ["settings", "journal", "habits", "projects", "goals", "note", "snooze", "deps", "template", "run", "theme", "sort", "view", "filter", "set", "export", "clear", "reload", "config",
-                "add", "stats", "changes", "review", "git", "todos", "sync", "calendar", "agenda", "focus", "track", "find", "links", "help", "quit", "w", "q"]
+    COMMANDS = ["issues", "prs", "settings", "journal", "habits", "projects", "goals", "note", "snooze", "deps", "template", "run", "theme", "sort", "view", "filter", "set", "export", "clear", "reload", "config",
+                "add", "stats", "changes", "review", "git", "todos", "sync", "bulk", "dump", "now", "graph", "travel", "calendar", "agenda", "events", "focus", "track", "find", "links", "help", "quit", "w", "q"]
 
     def act_palette(self):
         text = self.prompt(":", "", complete=self.COMMANDS, hist="cmd")
@@ -3433,16 +4172,30 @@ class App:
             self.say("config reloaded")
         elif cmd == "config":
             self.open_in_editor(self.cfg_path)
+        elif cmd == "events":
+            self.act_calendar("agenda")
         elif cmd == "stats":
             self.act_stats()
         elif cmd in ("changes", "history"):
             self.act_changes()
         elif cmd == "review":
             self.act_review()
+        elif cmd == "bulk":
+            self.act_bulk()
+        elif cmd == "dump":
+            self.act_dump()
+        elif cmd in ("now", "whatnow"):
+            self.act_whatnow()
+        elif cmd in ("graph", "map"):
+            self.act_graph()
+        elif cmd in ("travel", "timetravel"):
+            self.act_travel()
         elif cmd == "git":
             self.act_git()
         elif cmd == "todos":
             self.act_git_todos()
+        elif cmd in ("issues", "prs"):
+            self.act_gh_import("issue" if cmd == "issues" else "pr")
         elif cmd == "sync":
             if self.sync.enabled():
                 self.act_sync_now()
@@ -3874,7 +4627,7 @@ class App:
             ("NOTES, LINKS, PLANNING", ["notes", "note_add", "links", "link_add", "deps", "snooze", "template",
                                         "actions_menu"]),
             ("FILTER AND SORT", ["search", "clear_filter", "sort", "hide_done"]),
-            ("SCREENS AND TOOLS", ["journal", "habits", "projects", "calendar", "stats", "changes", "review", "git", "focus_mode", "track",
+            ("SCREENS AND TOOLS", ["journal", "habits", "projects", "calendar", "stats", "changes", "review", "git", "bulk", "dump", "whatnow", "graph", "travel", "focus_mode", "track",
                                    "theme", "settings", "palette", "help", "quit"]),
         ]
         seen = set()
@@ -4014,6 +4767,16 @@ class App:
             return "good " + ("morning" if h < 12 else "afternoon" if h < 18 else "evening"), "accent2", False
         if name == "week":
             return "week %d" % td.isocalendar()[1], "dim", False
+        if name == "event":
+            now = dt.datetime.now()
+            ongoing, nxt = next_event(self.ics_occ, now)
+            if ongoing:
+                return "now: %s until %s" % (clip(ongoing["summary"], 24), ongoing["end"].strftime("%H:%M")), "today", True
+            if nxt and (nxt["start"] - now) < dt.timedelta(hours=12):
+                mins = int((nxt["start"] - now).total_seconds() // 60)
+                when = ("in %dm" % mins) if mins < 60 else nxt["start"].strftime("%H:%M")
+                return "%s %s" % (clip(nxt["summary"], 24), when), "today" if mins <= 15 else "accent2", mins <= 15
+            return None
         if name == "sync":
             if not (o.get("git_sync") and self.sync.enabled()):
                 return None
@@ -4231,6 +4994,18 @@ class App:
         fixed = {"check": cell, "prio": pw, "tags": tag_w, "project": proj_w, "time": time_w, "due": due_w,
                  "est": est_w, "id": id_w, "deps": deps_w, "snooze": snz_w, "created": cre_w, "notes": 0}
         used = sum(fixed[c] + 1 for c in cols if c not in ("title", "notes") and fixed[c] > 0)
+        # narrow list: shrink tags and project first, then drop the least useful columns so nothing spills out
+        while w - 2 - used < 16 and (fixed["tags"] > 8 or fixed["project"] > 8):
+            key = "tags" if fixed["tags"] >= fixed["project"] else "project"
+            fixed[key] -= 1
+            used -= 1
+        for drop in ("created", "id", "snooze", "deps", "est", "time", "project", "tags", "due"):
+            if w - 2 - used >= 16:
+                break
+            if drop in cols and fixed[drop] > 0:
+                used -= fixed[drop] + 1
+                cols = [c for c in cols if c != drop]
+        tag_w, proj_w = fixed["tags"], fixed["project"]
         title_w = max(10, w - 2 - used)
         indent = max(0, int(self.opts.get("indent", 2)))
         tag_colors = self.opts.get("tag_colors", {}) or {}
@@ -4287,7 +5062,7 @@ class App:
                     if blocked:
                         suffix += " " + self.sym["blocked"]
                     gb = t.get("git") or {}
-                    if gb.get("branch") or gb.get("commits") or t.get("src"):
+                    if gb.get("branch") or gb.get("commits") or t.get("src") or t.get("gh"):
                         suffix += " " + self.sym["git"]
                     if t.get("woke") == iso_today and not done:
                         suffix += " " + self.sym["wake"]
@@ -4437,6 +5212,10 @@ class App:
                 row("branch", "%s (%s)" % (gi["branch"], gi.get("state", "active")), "ok" if gi.get("state") == "merged" else "accent2")
             for cm in (gi.get("commits") or [])[:4]:
                 row("commit", cm, "dim")
+            gh = t.get("gh") or {}
+            if gh.get("number"):
+                row("github", "%s #%d (%s)" % ("PR" if gh.get("kind") == "pr" else "issue", gh["number"], gh.get("state", "open")),
+                    "ok" if gh_done_state(gh.get("kind", "issue"), gh.get("state", "open")) else "accent2")
             if t.get("src"):
                 row("source", "%s:%s" % (t["src"].get("file", "?"), t["src"].get("line", "?")), "dim")
             lines.append(("", "fg", False))
@@ -5143,15 +5922,28 @@ class App:
             rows.append(("head", "Overdue", None))
             rows += [("task", t) for t in over]
         horizon = (td + dt.timedelta(days=90)).isoformat()
-        for k in sorted(x for x in by if tiso <= x <= horizon):
+        ev_by = {}
+        for n in range(0, 91):
+            d = td + dt.timedelta(days=n)
+            evs = self.events_on(d)
+            if evs:
+                ev_by[d.isoformat()] = evs
+        for k in sorted({x for x in by if tiso <= x <= horizon} | set(ev_by)):
             date = dt.date.fromisoformat(k)
             rows.append(("head", self.date_heading(date, td), date))
-            rows += [("task", t) for t in by[k]]
+            rows += [("event", o, date) for o in ev_by.get(k, [])]
+            rows += [("task", t) for t in by.get(k, [])]
         nodate = [t for t in self.store.tasks if not t["due"] and not t["done"] and t["parent"] is None]
         if nodate:
             rows.append(("head", "No date (%d)" % len(nodate), None))
             rows += [("task", t) for t in nodate[:20]]
         return rows
+
+    def cal_event_row(self, y, x, w, o, date):
+        lab = self.event_label(o, date)
+        cx = self.put(y, x + 1, pad(lab, 11), self.attr("accent", bold=True))
+        txt = o["summary"] + (("  " + o["location"]) if o["location"] else "")
+        self.put(y, cx + 1, txt, self.attr("fg"), max(1, x + w - cx - 2))
 
     def cal_task_row(self, y, x, w, t, cur, show_due=False):
         bg = "sel_bg" if cur else "bg"
@@ -5209,6 +6001,8 @@ class App:
                 else:
                     nrole = "fg"
                 self.put(cy, cx, "%2d" % d.day, self.attr(nrole, bg, bold=(d == td or is_sel)))
+                if chh > 1 and self.ics_occ and self.events_on(d):
+                    self.put(cy, cx + 3, "~", self.attr("accent", bg, bold=True))
                 if chh == 1:
                     if open_:
                         self.put(cy, cx + 3, str(len(open_)), self.attr("accent2", bg))
@@ -5235,7 +6029,10 @@ class App:
         if not rows:
             self.put(3, px + 1, "nothing due. press a to add a task for this day", self.attr("dim"), pw)
         for i, r in enumerate(rows[:H - 6]):
-            self.cal_task_row(3 + i, px, pw, r[1], i == cur_row)
+            if r[0] == "event":
+                self.cal_event_row(3 + i, px, pw, r[1], r[2])
+            else:
+                self.cal_task_row(3 + i, px, pw, r[1], i == cur_row)
 
     def cal_agenda(self, S, rows, trows, H, W):
         x, w = 2, W - 4
@@ -5258,6 +6055,8 @@ class App:
                 role = "overdue" if r[1].startswith("Overdue") else "accent2"
                 self.put(y, x, r[1], self.attr(role, bold=True))
                 self.put(y, x + cell_len(r[1]) + 1, self.sym["hline"] * max(0, w - cell_len(r[1]) - 1), self.attr("border"))
+            elif r[0] == "event":
+                self.cal_event_row(y, x, w, r[1], r[2])
             else:
                 self.cal_task_row(y, x, w, r[1], ri == cur_row, show_due=False)
 
@@ -5269,7 +6068,8 @@ class App:
         def compute():
             by = self.due_map()
             if S["mode"] == "month":
-                rows = [("task", t) for t in by.get(S["sel"].isoformat(), [])]
+                rows = [("event", o, S["sel"]) for o in self.events_on(S["sel"])]
+                rows += [("task", t) for t in by.get(S["sel"].isoformat(), [])]
             else:
                 rows = self.agenda_rows(by, td)
             trows = [i for i, r in enumerate(rows) if r[0] == "task"]
@@ -5293,7 +6093,7 @@ class App:
             self.put(0, x + 1, "calendar" if S["mode"] == "month" else "agenda", self.attr("accent2", "bar_bg", bold=True))
             self.fill(H - 1, 0, W, self.attr("fg", "bar_bg"))
             if S["mode"] == "month":
-                hint = "h/j/k/l day   [ ] month   t today   enter tasks   a add   v agenda   q close"
+                hint = "h/j/k/l day   [ ] month   t today   enter tasks   a add   i event to task   v agenda   q close"
                 if S["focus"] == "list":
                     hint = "j/k move   x done   < > shift day   m move   e edit   enter jump   esc back   a add"
             else:
@@ -5363,6 +6163,8 @@ class App:
                         S["focus"], S["idx"] = "list", 0
                     elif name == "a":
                         add_for(S["sel"])
+                    elif name == "i":
+                        self.pick_event_task(S["sel"])
                     continue
                 if name in ("j", "down"):
                     S["idx"] = min(len(trows) - 1, S["idx"] + 1)
@@ -5376,6 +6178,8 @@ class App:
                     S["focus"] = "grid"
                 elif name == "a":
                     add_for(cdate or td)
+                elif name == "i":
+                    self.pick_event_task(cdate or td)
                 elif cur is None:
                     continue
                 elif name in ("x", "space"):
@@ -5431,7 +6235,7 @@ class App:
         mins = {"work": o["focus_work"], "break": o["focus_break"], "long": o["focus_long"]}
         rounds_per = max(1, int(o["focus_rounds"]))
         F = {"phase": "work", "dur": mins["work"] * 60, "acc": 0.0, "start": time.monotonic(),
-             "iso": now_iso(), "running": True, "rounds": 0, "logged": 0, "rounds_per": rounds_per}
+             "iso": now_iso(), "running": True, "rounds": 0, "logged": 0, "rounds_per": rounds_per, "parked": []}
         self.hook("on_focus_start", t)
         self.backdrop = lambda: self.draw_focus(t, F)
         completed = False
@@ -5461,6 +6265,8 @@ class App:
                         F["iso"] = now_iso()
                 elif name == "n":
                     self.focus_advance(t, F, mins, skipped=True)
+                elif name == "p":
+                    self.focus_park(t, F)
                 elif name in ("+", "="):
                     F["dur"] += 300
                 elif name == "-":
@@ -5477,7 +6283,30 @@ class App:
             with self.edit():
                 self.complete(t, True)
         self.hook("on_focus_end", t)
-        self.say("focus ended: %s logged, %d round%s" % (fmt_duration(F["logged"]), F["rounds"], "" if F["rounds"] == 1 else "s"), "ok", 5)
+        msg = "focus ended: %s logged, %d round%s" % (fmt_duration(F["logged"]), F["rounds"], "" if F["rounds"] == 1 else "s")
+        if F["parked"]:
+            msg += ", %d thought%s parked in the inbox" % (len(F["parked"]), "" if len(F["parked"]) == 1 else "s")
+        self.say(msg, "ok", 6)
+
+    def focus_park(self, t, F):
+        """Parking lot: capture a stray thought as an inbox task without leaving focus."""
+        text = self.prompt("parking lot: what just came to mind?", hist="park")
+        if not text or not text.strip():
+            return
+        p = parse_quick(text)
+        if not p["title"]:
+            return
+        with self.edit():
+            n = self.store.add(p["title"])
+            apply_parsed_task(n, p, True)
+            if "parked" not in n["tags"]:
+                n["tags"].append("parked")
+            note = "parked at %s while focusing on: %s" % (dt.datetime.now().strftime("%H:%M"), t["title"])
+            n["notes"] = (n["notes"].rstrip() + "\n" if n["notes"].strip() else "") + note
+            if not p["project"]:
+                n["project"] = ""
+        F["parked"].append(n["id"])
+        self.say("parked: " + clip(p["title"], 40), "ok", 3)
 
     def focus_advance(self, t, F, mins, skipped=False):
         self.focus_flush(t, F)
@@ -5573,7 +6402,11 @@ class App:
                     lvl = max(1, min(8, int(v * 8.99)))
                     r = "dim" if y == H - 5 else (thirds[min(2, x * 3 // max(1, W))] if phase == "work" else role)
                     self.put(y, x, "~" if ascii_ else BLOCKS[lvl], self.attr(r))
-        self.put(H - 1, 1, "space pause   n skip   + - 5 min   r restart   x done   q leave", self.attr("dim"), W - 2)
+        if F.get("parked"):
+            last = self.store.get(F["parked"][-1])
+            center(H - 3 if H >= 18 else H - 2, "parked %d%s" % (len(F["parked"]), (": " + clip(last["title"], max(10, W - 24))) if last else ""),
+                   self.attr("accent2"))
+        self.put(H - 1, 1, "space pause   n skip   + - 5 min   r restart   p park a thought   x done   q leave", self.attr("dim"), W - 2)
         if self.msg and time.time() < self.msg_until:
             center(H - 2, self.msg, self.attr(self.msg_kind, bold=True))
 
@@ -6913,19 +7746,36 @@ class App:
         repos |= {(t.get("git") or {}).get("repo") for t in self.store.tasks if (t.get("git") or {}).get("repo")}
         return jobs, sorted(r for r in repos if r)
 
+    def gh_jobs(self):
+        """Open tasks linked to GitHub, grouped as {(dir, kind): [task ids]}."""
+        groups = {}
+        for t in self.store.tasks:
+            g = t.get("gh") or {}
+            if g.get("number") and g.get("dir") and not t["done"]:
+                groups.setdefault((g["dir"], g.get("kind", "issue")), []).append(t["id"])
+        return groups
+
     def git_refresh(self, force=False):
         """Start a background check of linked branches and commit references."""
         if self.git_thread is not None and self.git_thread.is_alive():
             return
         jobs, repos = self.git_jobs()
-        if not jobs and not repos:
+        ghg = self.gh_jobs()
+        if not jobs and not repos and not ghg:
             if force:
                 self.say("nothing linked to git yet", "dim")
             return
         self.git_force = force
 
         def work():
-            res = {"states": {}, "mentions": []}
+            res = {"states": {}, "mentions": [], "gh": {}}
+            for (gdir, kind), ids in ghg.items():
+                items, _err = gh_list(gdir, kind, mine=False, state="all", limit=200)
+                by = {i["number"]: i["state"] for i in items}
+                for tid in ids:
+                    num = self.store.get(tid)["gh"]["number"]
+                    if num in by:
+                        res["gh"][tid] = by[num]
             for j in jobs:
                 res["states"][j["id"]] = git_probe(j)
             for r in repos:
@@ -6946,6 +7796,14 @@ class App:
         res = self.git_results.pop(0)
         done_now, linked = [], 0
         with self.edit():
+            for tid, state in res.get("gh", {}).items():
+                t = self.store.get(tid)
+                if not t:
+                    continue
+                t["gh"]["state"] = state
+                if gh_done_state(t["gh"].get("kind", "issue"), state) and not t["done"] and self.opts.get("git_auto_done", True):
+                    self.complete(t, True)
+                    done_now.append(t["title"])
             for tid, state in res["states"].items():
                 t = self.store.get(tid)
                 if not t:
@@ -6984,15 +7842,19 @@ class App:
         t = self.current()
         opts = []
         opts.append(("Find TODOs in a project folder", self.act_git_todos))
+        opts.append(("Import my GitHub issues", lambda: self.act_gh_import("issue")))
+        opts.append(("Import my GitHub pull requests", lambda: self.act_gh_import("pr")))
         if t:
             g = t.get("git") or {}
             opts.append(("Link a branch to this task", lambda: self.act_git_branch(t)))
             opts.append(("Link a commit to this task", lambda: self.act_git_commit(t)))
-            if g.get("branch") or g.get("commits"):
+            opts.append(("Link a GitHub issue or PR to this task", lambda: self.act_gh_link(t)))
+            if g.get("branch") or g.get("commits") or t.get("gh"):
                 opts.append(("Unlink git from this task", lambda: self.act_git_unlink(t)))
             if t["project"]:
                 opts.append(("Set folder for @%s" % t["project"], lambda: self.act_git_path(t["project"])))
         opts.append(("Check branches and commits now", lambda: self.git_refresh(True)))
+        opts.append(("Time travel through data history", self.act_travel))
         if self.sync.enabled():
             opts.append(("Sync data now (commit%s)" % (" and push" if self.opts.get("git_push") else ""), self.act_sync_now))
         else:
@@ -7076,9 +7938,78 @@ class App:
                 known.insert(0, "%s %s" % rows[i])
         self.say("commit linked", "ok")
 
+    def gh_ready(self):
+        if not shutil.which("gh"):
+            self.say("the GitHub CLI (gh) is not installed. install it and run gh auth login", "err", 6)
+            return False
+        return True
+
+    def act_gh_import(self, kind):
+        if not self.gh_ready():
+            return
+        pname, path = self.pick_project_folder("GitHub %ss for" % kind)
+        if not pname:
+            return
+        gdir = os.path.abspath(os.path.expanduser(path))
+        self.say("asking GitHub...", "dim")
+        self.draw()
+        self.present()
+        items, err = gh_list(gdir, kind, mine=True)
+        if err:
+            self.say("gh: " + err, "err", 6)
+            return
+        label = "issue" if kind == "issue" else "PR"
+        rows = [{"key": "%s|%s|%d" % (gdir, kind, i["number"]), "kind": "#%d" % i["number"],
+                 "text": ("[draft] " if i["draft"] else "") + i["title"], "loc": " ".join(i["labels"][:3]), "item": i}
+                for i in items]
+
+        def tracked():
+            return {"%s|%s|%d" % (t["gh"].get("dir"), t["gh"].get("kind"), t["gh"].get("number")) for t in self.store.tasks if t.get("gh")}
+
+        def make(chosen):
+            for r in chosen:
+                i = r["item"]
+                t = self.store.add(i["title"])
+                t["project"] = pname
+                t["tags"] = [label.lower()] + [re.sub(r"\s+", "-", x.lower()) for x in i["labels"][:2]]
+                t["notes"] = i["url"]
+                t["gh"] = {"dir": gdir, "kind": kind, "number": i["number"], "url": i["url"], "state": i["state"]}
+            return len(chosen)
+
+        self.import_screen("my GitHub %ss in @%s" % (label, pname), rows, make, tracked=tracked,
+                           hint="closed or merged ones complete their task")
+
+    def act_gh_link(self, t):
+        if not self.gh_ready():
+            return
+        gdir = self.task_repo(t)
+        if not gdir:
+            self.say("no git repo found. set a project folder with the git menu", "err")
+            return
+        self.say("asking GitHub...", "dim")
+        self.draw()
+        self.present()
+        issues, e1 = gh_list(gdir, "issue", mine=False)
+        prs, e2 = gh_list(gdir, "pr", mine=False)
+        items = prs + issues
+        if not items:
+            self.say("gh: " + (e1 or e2 or "no open issues or PRs"), "err" if (e1 or e2) else "dim", 6)
+            return
+        i = self.menu("link to", ["%s #%-5d %s" % ("PR " if x["kind"] == "pr" else "iss", x["number"], clip(x["title"], 56)) for x in items])
+        if i is None:
+            return
+        x = items[i]
+        with self.edit():
+            t["gh"] = {"dir": gdir, "kind": x["kind"], "number": x["number"], "url": x["url"], "state": x["state"]}
+            if x["url"] and x["url"] not in t["notes"]:
+                t["notes"] = (x["url"] + "\n" + t["notes"]).rstrip()
+        self.say("linked %s #%d" % (x["kind"], x["number"]), "ok")
+        self.git_next = 0.0
+
     def act_git_unlink(self, t):
         with self.edit():
             t["git"] = {}
+            t["gh"] = {}
         self.say("git links removed", "ok")
 
     def act_sync_setup(self):
@@ -7098,28 +8029,34 @@ class App:
         self.sync.mark(["manual sync"], delay=0)
         self.say("syncing...", "dim")
 
-    def act_git_todos(self):
+    def pick_project_folder(self, title):
+        """Choose a project folder. Returns (project name, folder) or (None, None)."""
         cands = sorted((n, m["path"]) for n, m in self.store.projects.items() if m.get("path"))
         view_p = self.view[2:] if self.view.startswith("p:") else ""
         names = [n for n, _ in cands]
         labels = ["%s  (%s)" % (n, clip(p, 40)) for n, p in cands] + ["another folder..."]
-        i = self.menu("find TODOs in", labels, names.index(view_p) if view_p in names else 0)
+        i = self.menu(title, labels, names.index(view_p) if view_p in names else 0)
         if i is None:
-            return
+            return None, None
         if i < len(cands):
-            pname, path = cands[i]
-        else:
-            path = self.prompt("folder to scan", os.getcwd())
-            if not path or not os.path.isdir(os.path.expanduser(path.strip())):
-                self.say("that folder does not exist", "err")
-                return
-            path = path.strip()
-            pname = self.prompt("project name for imported tasks", re.sub(r"\W+", "-", os.path.basename(os.path.abspath(os.path.expanduser(path)))).strip("-"))
-            if not pname or not pname.strip():
-                return
-            pname = pname.strip().replace(" ", "-")
-            with self.edit():
-                self.store.projects.setdefault(pname, {})["path"] = path
+            return cands[i]
+        path = self.prompt("folder", os.getcwd())
+        if not path or not os.path.isdir(os.path.expanduser(path.strip())):
+            self.say("that folder does not exist", "err")
+            return None, None
+        path = path.strip()
+        pname = self.prompt("project name for imported tasks", re.sub(r"\W+", "-", os.path.basename(os.path.abspath(os.path.expanduser(path)))).strip("-"))
+        if not pname or not pname.strip():
+            return None, None
+        pname = pname.strip().replace(" ", "-")
+        with self.edit():
+            self.store.projects.setdefault(pname, {})["path"] = path
+        return pname, path
+
+    def act_git_todos(self):
+        pname, path = self.pick_project_folder("find TODOs in")
+        if not pname:
+            return
         repo = os.path.abspath(os.path.expanduser(path))
         self.say("scanning %s..." % clip(repo, 40), "dim")
         self.draw()
@@ -7369,6 +8306,788 @@ class App:
             elif name in ("x", "t", "w", "s", "r", "D") and lst:
                 S["i"] = max(0, min(S["i"], len(lst) - 1))
                 act(lst[S["i"]], name)
+            return False
+
+        self.screen_loop(render, handle)
+
+    # ----- generic import picker, brain dump, bulk edit -----
+
+    def import_screen(self, title, rows, make, tracked=None, preselect=False, hint=""):
+        """Fullscreen checklist for importing things as tasks.
+
+        rows: dicts with text (required), kind, loc, depth and key. tracked() returns keys already
+        imported. make(chosen rows) creates the tasks and returns how many it made."""
+        S = {"i": 0, "top": 0, "sel": set(range(len(rows))) if preselect else set()}
+
+        def known():
+            return tracked() if tracked else set()
+
+        def render():
+            H, W = self.scr.getmaxyx()
+            self.scr.erase()
+            tr = known()
+            new = sum(1 for r in rows if r.get("key") not in tr)
+            self.screen_bar(W, title, "%d found  %d new  %d selected " % (len(rows), new, len(S["sel"])))
+            room = max(1, H - 3)
+            S["i"] = max(0, min(S["i"], len(rows) - 1))
+            S["top"] = max(0, min(S["top"], max(0, len(rows) - room)))
+            if S["i"] < S["top"]:
+                S["top"] = S["i"]
+            if S["i"] >= S["top"] + room:
+                S["top"] = S["i"] - room + 1
+            if not rows:
+                self.put(2, 2, "nothing found.", self.attr("dim"))
+            for r in range(room):
+                k = S["top"] + r
+                if k >= len(rows):
+                    break
+                row = rows[k]
+                on = k == S["i"]
+                is_known = row.get("key") in tr
+                role = "dim" if is_known else "fg"
+                bg = "sel_bg" if on else "bg"
+                self.fill(1 + r, 0, W, self.attr(role, bg))
+                mark = "[x]" if k in S["sel"] else ("[=]" if is_known else "[ ]")
+                x = self.put(1 + r, 2, mark + " ", self.attr("ok" if k in S["sel"] else role, bg))
+                if row.get("kind"):
+                    x = self.put(1 + r, x, pad(row["kind"], 6) + " ", self.attr("accent2", bg, bold=True))
+                x += 2 * row.get("depth", 0)
+                loc = row.get("loc", "")
+                lw = min(cell_len(loc), max(0, W // 3)) if loc else 0
+                self.put(1 + r, x, row["text"], self.attr(role, bg, bold=on), max(4, W - x - lw - 3))
+                if loc:
+                    self.put(1 + r, W - lw - 2, clip(loc, lw), self.attr("dim", bg), lw)
+            self.screen_foot(H, W, (hint + "   " if hint else "") + "j/k move  space select  a all  n none  enter import  q close")
+
+        def handle(name, ch):
+            if name in ("q", "esc", "ctrl-c"):
+                return True
+            if name in ("j", "down"):
+                S["i"] += 1
+            elif name in ("k", "up"):
+                S["i"] -= 1
+            elif name in ("g", "home"):
+                S["i"] = 0
+            elif name in ("G", "end"):
+                S["i"] = len(rows) - 1
+            elif name in ("ctrl-d", "pagedown"):
+                S["i"] += 10
+            elif name in ("ctrl-u", "pageup"):
+                S["i"] -= 10
+            elif name == "space" and rows:
+                S["sel"] ^= {S["i"]}
+                S["i"] += 1
+            elif name == "a":
+                tr = known()
+                S["sel"] = {k for k, r in enumerate(rows) if r.get("key") not in tr}
+            elif name == "n":
+                S["sel"] = set()
+            elif name == "enter" and rows:
+                tr = known()
+                pick = sorted(S["sel"]) or [S["i"]]
+                chosen = [rows[k] for k in pick if rows[k].get("key") not in tr]
+                if not chosen:
+                    self.say("nothing new selected", "dim")
+                    return False
+                with self.edit():
+                    n = make(chosen)
+                self.say("imported %d task%s" % (n, "" if n == 1 else "s"), "ok")
+                return True
+            return False
+
+        self.screen_loop(render, handle)
+
+    def act_dump(self):
+        vp = self.view[2:] if self.view.startswith("p:") else ""
+        text = self.edit_text("brain dump", "", footer="one per line, indent = subtask, ctrl-s to continue")
+        if text is None or not text.strip():
+            return
+        items = parse_dump(text, vp)
+        if not items:
+            self.say("nothing to import", "dim")
+            return
+        rows = []
+        for n, it in enumerate(items):
+            bits = []
+            if it["due"] is not UNSET and it["due"]:
+                bits.append("due " + it["due"][5:])
+            if it["project"]:
+                bits.append("@" + it["project"])
+            bits += ["#" + g for g in it["tags"]]
+            if it["prio"]:
+                bits.append("!" * it["prio"])
+            rows.append({"key": n, "text": it["title"], "depth": it["depth"], "loc": " ".join(bits)})
+
+        def make(chosen):
+            keep = {r["key"] for r in chosen}
+            made = create_from_items(self.store, [items[i] for i in sorted(keep)])
+            for t in made[:1]:
+                self.cur_id = t["id"]
+            return len(made)
+
+        self.import_screen("brain dump", rows, make, preselect=True)
+
+    def select_matching(self):
+        text = self.prompt("select tasks matching  (#work due:overdue !2+ ...)", "", hist="filter")
+        if not text or not text.strip():
+            return False
+        try:
+            f = compile_query(text, self.store)
+        except Exception:
+            self.say("could not read that filter", "err")
+            return False
+        td = today()
+        want_done = "is:done" in text
+        self.selected = {t["id"] for t in self.store.tasks if f(t, td) and (want_done or not t["done"])}
+        self.say("%d selected" % len(self.selected), "ok" if self.selected else "dim")
+        return bool(self.selected)
+
+    def act_bulk(self):
+        while True:
+            ts = self.targets()
+            n = len(self.selected)
+            opts = [("select tasks matching a filter...", "select")]
+            if ts:
+                opts += [("set project...", "project"), ("add tags...", "tag+"), ("remove tags...", "tag-"),
+                         ("set due date...", "due"), ("clear due date", "nodue"),
+                         ("priority: none", "p0"), ("priority: low", "p1"), ("priority: medium", "p2"), ("priority: high", "p3"),
+                         ("snooze...", "snooze"), ("mark done", "done"), ("reopen", "open"), ("delete", "delete")]
+            title = "bulk edit: %s" % ("%d selected" % n if n else ("1 task" if ts else "no tasks"))
+            i = self.menu(title, [o[0] for o in opts])
+            if i is None:
+                return
+            op = opts[i][1]
+            if op == "select":
+                if not self.select_matching():
+                    return
+                continue
+            break
+        ids = [t["id"] for t in ts]
+        td = today()
+        if op == "snooze":
+            self.act_snooze()
+            return
+        if op == "delete":
+            self.act_delete()
+            return
+        if op in ("done", "open"):
+            if op == "done" and not self.blocked_gate(ts):
+                return
+            with self.edit():
+                for t in ts:
+                    self.complete(t, op == "done")
+            self.say("%d updated" % len(ts), "ok")
+            return
+        value = None
+        if op == "project":
+            value = self.prompt("project for %d tasks  (empty clears)" % len(ts))
+            if value is None:
+                return
+            value = value.strip().lstrip("@").replace(" ", "-")
+        elif op in ("tag+", "tag-"):
+            value = self.prompt("tags to %s" % ("add" if op == "tag+" else "remove"))
+            if not value or not value.strip():
+                return
+            value = [w.lower().lstrip("#") for w in value.split() if w.strip("#")]
+        elif op == "due":
+            text = self.prompt("due date for %d tasks  (fri, +3d, 12-25, none)" % len(ts))
+            if not text or not text.strip():
+                return
+            try:
+                d = parse_date(text.strip(), td)
+            except ValueError:
+                self.say("could not read that date", "err")
+                return
+            value = d.isoformat() if d else None
+        with self.edit():
+            for t in ts:
+                if op == "project":
+                    t["project"] = value
+                elif op == "tag+":
+                    t["tags"] += [g for g in value if g not in t["tags"]]
+                elif op == "tag-":
+                    t["tags"] = [g for g in t["tags"] if g not in value]
+                elif op == "due":
+                    t["due"] = value
+                elif op == "nodue":
+                    t["due"] = None
+                elif op.startswith("p") and op[1:].isdigit():
+                    t["prio"] = int(op[1:])
+        self.say("%d updated" % len(ids), "ok")
+
+    # ----- calendar events from .ics files -----
+
+    def ics_cache_path(self, src):
+        import hashlib
+        return os.path.join(os.path.dirname(self.store.path), "ics-%s.ics" % hashlib.sha1(src.encode()).hexdigest()[:8])
+
+    @staticmethod
+    def ics_url(src):
+        src = src.strip()
+        if src.startswith("webcal://"):
+            src = "https://" + src[len("webcal://"):]
+        return src
+
+    def ics_read(self, path):
+        try:
+            with open(os.path.expanduser(path), "r", encoding="utf-8", errors="replace") as fh:
+                return fh.read()
+        except OSError:
+            return ""
+
+    def ics_fetch(self, src):
+        """Text of one calendar source. Web calendars are downloaded and cached in the data folder."""
+        src = self.ics_url(src)
+        if not re.match(r"^https?://", src):
+            return self.ics_read(src)
+        cache = self.ics_cache_path(src)
+        try:
+            import urllib.request
+            req = urllib.request.Request(src, headers={"User-Agent": "synth"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = r.read().decode("utf-8", "replace")
+            if "BEGIN:VCALENDAR" in data:
+                with contextlib.suppress(OSError):
+                    with open(cache, "w", encoding="utf-8") as fh:
+                        fh.write(data)
+                return data
+        except Exception:
+            pass
+        return self.ics_read(cache)
+
+    def ics_cached(self, src):
+        src = self.ics_url(src)
+        return self.ics_read(self.ics_cache_path(src) if re.match(r"^https?://", src) else src)
+
+    def ics_rebuild(self, events):
+        td = today()
+        self.ics_raw = events
+        self.ics_occ = expand_events(events, td - dt.timedelta(days=2), td + dt.timedelta(days=150))
+        self.ics_day = td.isoformat()
+
+    def ics_poll(self):
+        srcs = [x for x in (self.opts.get("ics_sources") or []) if isinstance(x, str) and x.strip()]
+        if not srcs:
+            if self.ics_occ:
+                self.ics_occ, self.ics_raw = [], []
+            return
+        if self.ics_loaded is not None:
+            events, self.ics_loaded = self.ics_loaded, None
+            self.ics_rebuild(events)
+            return
+        if self.ics_day != today().isoformat() and self.ics_raw:
+            self.ics_rebuild(self.ics_raw)
+        if not self.ics_started:
+            self.ics_started = True
+            events = []
+            for sx in srcs:
+                events += parse_ics(self.ics_cached(sx))
+            self.ics_rebuild(events)
+        mins = max(1, int(self.opts.get("ics_refresh", 30) or 30))
+        if time.time() >= self.ics_next and (self.ics_thread is None or not self.ics_thread.is_alive()):
+            self.ics_next = time.time() + mins * 60
+
+            def work():
+                evs = []
+                for sx in srcs:
+                    evs += parse_ics(self.ics_fetch(sx))
+                self.ics_loaded = evs
+            self.ics_thread = threading.Thread(target=work, daemon=True)
+            self.ics_thread.start()
+
+    def events_on(self, date):
+        out = []
+        for o in self.ics_occ:
+            last = (o["end"] - dt.timedelta(seconds=1)).date() if o["end"] > o["start"] else o["start"].date()
+            if o["start"].date() <= date <= last:
+                out.append(o)
+        return out
+
+    def event_label(self, o, date=None):
+        if o["all_day"]:
+            return "all day"
+        s0, e0 = o["start"], o["end"]
+        a = s0.strftime("%H:%M") if not date or s0.date() == date else "00:00"
+        b = e0.strftime("%H:%M") if not date or e0.date() == date else "24:00"
+        return a if e0 <= s0 else "%s-%s" % (a, b)
+
+    def free_minutes(self):
+        """Minutes until the next timed event today, 0 during one, or None without any."""
+        now = dt.datetime.now()
+        ongoing, nxt = next_event(self.ics_occ, now)
+        if ongoing:
+            return 0
+        if nxt and nxt["start"].date() == now.date():
+            return int((nxt["start"] - now).total_seconds() // 60)
+        return None
+
+    def pick_event_task(self, day):
+        evs = self.events_on(day)
+        if not evs:
+            self.say("no calendar events that day", "dim")
+            return
+        j = self.menu("add event as task", ["%s  %s" % (pad(self.event_label(o, day), 11), clip(o["summary"], 40)) for o in evs])
+        if j is not None:
+            self.event_to_task(evs[j], day)
+
+    def event_to_task(self, o, date):
+        key = "ics|%s|%s" % (o["uid"], o["start"].isoformat())
+        for t in self.store.tasks:
+            if (t.get("src") or {}).get("key") == key:
+                self.say("already a task", "dim")
+                return None
+        with self.edit():
+            t = self.store.add(o["summary"])
+            t["due"] = date.isoformat()
+            t["tags"] = ["event"]
+            if not o["all_day"]:
+                mins = int((o["end"] - o["start"]).total_seconds() // 60)
+                if 0 < mins <= 480:
+                    t["est"] = mins * 60
+            t["notes"] = (self.event_label(o, date) + ((" at " + o["location"]) if o["location"] else "")).strip()
+            t["src"] = {"key": key, "file": "calendar", "line": o["start"].strftime("%H:%M")}
+        self.say("added as a task for " + date.isoformat(), "ok")
+        return t
+
+    # ----- what now -----
+
+    def act_whatnow(self):
+        free = self.free_minutes()
+        S = {"min": free if free else 60, "energy": 1, "i": 0, "from_cal": bool(free)}
+        med = calibration(est_samples(self.store))
+        median = med["median"] if med["n"] >= 3 else 1.0
+
+        def ranked():
+            a = self.store.active
+            cur = self.store.get(a["id"]) if a else None
+            return whatnow_rank(self.store, today(), S["min"], ENERGY_LEVELS[S["energy"]], median,
+                                cur["project"] if cur else "")
+
+        def render():
+            H, W = self.scr.getmaxyx()
+            self.scr.erase()
+            res = ranked()
+            self.screen_bar(W, "what now", "%d candidates " % len(res))
+            until = ""
+            if S["from_cal"]:
+                _, nxt = next_event(self.ics_occ, dt.datetime.now())
+                if nxt:
+                    until = "  (until %s at %s)" % (clip(nxt["summary"], 24), nxt["start"].strftime("%H:%M"))
+            self.put(2, 2, "I have", self.attr("dim"))
+            x = self.put(2, 9, fmt_duration(S["min"] * 60) if S["min"] else "0m", self.attr("accent", bold=True))
+            x = self.put(2, x + 1, "and", self.attr("dim"))
+            x = self.put(2, x + 1, ENERGY_LEVELS[S["energy"]], self.attr("accent2", bold=True))
+            x = self.put(2, x + 1, "energy" + until, self.attr("dim"))
+            if median and abs(median - 1.0) > 0.1:
+                self.put(3, 2, "estimates scaled by x%.2f from your history" % median, self.attr("dim"))
+            room = max(1, (H - 7) // 2)
+            S["i"] = max(0, min(S["i"], len(res) - 1))
+            top = max(0, min(S["i"] - room + 1, max(0, len(res) - room))) if S["i"] >= room else 0
+            if not res:
+                self.put(5, 4, "nothing fits. try more time or press m to change it.", self.attr("dim"))
+            for r in range(room):
+                k = top + r
+                if k >= len(res):
+                    break
+                sc, t, why = res[k]
+                on = k == S["i"]
+                bg = "sel_bg" if on else "bg"
+                y = 5 + r * 2
+                self.fill(y, 0, W, self.attr("fg", bg))
+                self.fill(y + 1, 0, W, self.attr("fg", bg))
+                x = self.put(y, 2, "%d." % (k + 1), self.attr("accent" if k == 0 else "dim", bg, bold=True))
+                self.put(y, x + 1, t["title"] + (("  @" + t["project"]) if t["project"] else ""), self.attr("fg", bg, bold=on), W - x - 4)
+                self.put(y + 1, 6, ", ".join(why[:4]) if why else "no particular reason", self.attr("dim", bg), W - 8)
+            self.screen_foot(H, W, "j/k  enter track  f focus  x done  z snooze  m time  e energy  o show in list  q close")
+
+        def handle(name, ch):
+            if name in ("q", "esc", "ctrl-c"):
+                return True
+            if name in ("j", "down"):
+                S["i"] += 1
+            elif name in ("k", "up"):
+                S["i"] -= 1
+            elif name == "e":
+                S["energy"] = (S["energy"] + 1) % 3
+                S["i"] = 0
+            elif name == "m":
+                text = self.prompt("minutes available  (30, 45m, 1h30, empty for unlimited)", str(S["min"] or ""))
+                if text is None:
+                    return False
+                text = text.strip()
+                if not text:
+                    S["min"], S["from_cal"] = None, False
+                else:
+                    try:
+                        secs = parse_duration(text if re.search(r"[a-zA-Z]", text) else text + "m")
+                    except ValueError:
+                        self.say("could not read that time", "err")
+                        return False
+                    S["min"], S["from_cal"] = max(1, secs // 60), False
+                S["i"] = 0
+            else:
+                res = ranked()
+                if not res:
+                    return False
+                t = res[max(0, min(S["i"], len(res) - 1))][1]
+                if name == "enter":
+                    a = self.store.active
+                    if a:
+                        self.stop_tracking(False)
+                    self.store.active = {"id": t["id"], "start": now_iso()}
+                    self.store.save()
+                    self.say("tracking: " + clip(t["title"], 40), "ok")
+                    return True
+                if name == "f":
+                    self.jump_to(t["id"])
+                    self.backdrop = self.draw
+                    self.act_focus()
+                    return True
+                if name == "o":
+                    self.jump_to(t["id"])
+                    return True
+                if name == "x":
+                    with self.edit():
+                        self.complete(t, True)
+                elif name == "z":
+                    with self.edit():
+                        t["snooze"] = (today() + dt.timedelta(days=1)).isoformat()
+            return False
+
+        self.screen_loop(render, handle)
+
+    # ----- dependency graph -----
+
+    def act_graph(self):
+        S = {"show_done": False, "g": None, "sel": None, "vx": 0, "vy": 0, "cache": None}
+        GUT = 6
+
+        def build():
+            g = dep_graph(self.store, S["show_done"])
+            S["g"] = g
+            S["pos"] = {k: n for c in g["comps"] for k, n in c["nodes"].items() if not n["dummy"]}
+            if S["sel"] not in S["pos"]:
+                S["sel"] = g["bott"] if g["bott"] in S["pos"] else (min(S["pos"], key=lambda k: (S["pos"][k]["layer"], S["pos"][k]["y"])) if S["pos"] else None)
+            S["cache"] = None
+
+        def geometry(W):
+            layers = max(1, S["g"]["layers"])
+            cw = max(18, min(32, (W - 4 - GUT * (layers - 1)) // layers))
+            return cw
+
+        def canvas(cw):
+            """Edge cells for the whole graph, in virtual coordinates."""
+            cells = {}
+            for c in S["g"]["comps"]:
+                nodes = c["nodes"]
+                counter = collections.Counter()
+                for a, b, orig in c["edges"]:
+                    na, nb = nodes[a], nodes[b]
+                    crit = orig in S["g"]["crit_edges"]
+                    x0 = na["layer"] * (cw + GUT) + cw
+                    x1 = nb["layer"] * (cw + GUT) - (1 if nb["dummy"] else 2)
+                    k = counter[na["layer"]]
+                    counter[na["layer"]] += 1
+                    xm = x0 + 1 + (k % 3)
+                    graph_route(cells, x0, na["y"], x1, nb["y"], min(xm, x1), crit)
+                for k, n in nodes.items():
+                    if n["dummy"]:
+                        for x in range(cw):
+                            cx = n["layer"] * (cw + GUT) + x
+                            m, cr = cells.get((cx, n["y"]), (0, False))
+                            orig_crit = any(o in S["g"]["crit_edges"] for _a, _b, o in c["edges"] if _a == k or _b == k)
+                            cells[(cx, n["y"])] = (m | 3, cr or orig_crit)
+            return cells
+
+        def render():
+            H, W = self.scr.getmaxyx()
+            self.scr.erase()
+            if S["g"] is None:
+                build()
+            g = S["g"]
+            self.screen_bar(W, "dependency graph", "d %s done  " % ("hide" if S["show_done"] else "show"))
+            if not S["pos"]:
+                self.put(3, 3, "no dependencies yet. press B on a task to add some.", self.attr("dim"))
+                self.screen_foot(H, W, "d show done tasks   q close")
+                return
+            cw = geometry(W)
+            if S["cache"] is None or S["cache"][0] != cw:
+                S["cache"] = (cw, canvas(cw))
+            cells = S["cache"][1]
+            tasks_open = [t for t in self.store.tasks if t["id"] in S["pos"] and not t["done"]]
+            bott = self.store.get(g["bott"]) if g["bott"] else None
+            summary = "critical path %d task%s, about %s" % (len(g["crit"]), "" if len(g["crit"]) == 1 else "s", fmt_duration(g["crit_secs"]))
+            if bott:
+                summary += "     bottleneck: %s (unblocks %d)" % (clip(bott["title"], 30), g["dependents"][bott["id"]])
+            self.put(1, 2, summary, self.attr("accent2", bold=True), W - 4)
+            top, bottom = 3, H - 5
+            vh = bottom - top
+            vw = W - 3
+            sel = S["pos"].get(S["sel"])
+            if sel:
+                sx, sy = sel["layer"] * (cw + GUT), sel["y"]
+                if sx < S["vx"]:
+                    S["vx"] = max(0, sx - 2)
+                if sx + cw > S["vx"] + vw:
+                    S["vx"] = sx + cw - vw + 2
+                if sy < S["vy"]:
+                    S["vy"] = max(0, sy - 1)
+                if sy >= S["vy"] + vh:
+                    S["vy"] = sy - vh + 2
+            ascii_ = self.opts["ascii"]
+            table = GRAPH_ASCII if ascii_ else GRAPH_CHARS
+            for (cx, cy), (mask, crit) in cells.items():
+                sx_, sy_ = cx - S["vx"] + 1, cy - S["vy"] + top
+                if top <= sy_ < bottom and 1 <= sx_ < W - 1:
+                    self.put(sy_, sx_, table.get(mask, "+"), self.attr("accent" if crit else "border"))
+            arrow = ">" if ascii_ else "▸"
+            for c in g["comps"]:
+                for a, b, orig in c["edges"]:
+                    nb = c["nodes"][b]
+                    if nb["dummy"]:
+                        continue
+                    ax, ay = nb["layer"] * (cw + GUT) - 1 - S["vx"] + 1, nb["y"] - S["vy"] + top
+                    if top <= ay < bottom and 1 <= ax < W - 1:
+                        self.put(ay, ax, arrow, self.attr("accent" if orig in g["crit_edges"] else "dim"))
+                for k, n in c["nodes"].items():
+                    if n["dummy"]:
+                        continue
+                    t = self.store.get(k)
+                    nx, ny = n["layer"] * (cw + GUT) - S["vx"] + 1, n["y"] - S["vy"] + top
+                    if not (top <= ny < bottom) or nx + cw < 1 or nx >= W - 1:
+                        continue
+                    on = k == S["sel"]
+                    bg = "sel_bg" if on else "bg"
+                    blocked = bool(blockers(self.store, t))
+                    if t["done"]:
+                        mark, mrole = self.sym["check_on"], "done"
+                    elif blocked:
+                        mark, mrole = self.sym["blocked"], "p3"
+                    else:
+                        mark, mrole = self.sym["check_off"], "ok"
+                    trole = "done" if t["done"] else ("accent" if k in g["crit"] else "fg")
+                    cnt = g["dependents"].get(k, 0)
+                    tail = (" +%d" % cnt) if cnt else ""
+                    self.fill(ny, nx, cw, self.attr("fg", bg))
+                    x = self.put(ny, nx, mark + " ", self.attr(mrole, bg, bold=True), cw)
+                    self.put(ny, x, clip(t["title"], cw - cell_len(mark) - 1 - cell_len(tail)), self.attr(trole, bg, bold=(on or k in g["crit"])), cw - (x - nx))
+                    if tail:
+                        self.put(ny, nx + cw - cell_len(tail), tail, self.attr("accent2", bg, bold=True))
+            t = self.store.get(S["sel"])
+            if t:
+                need = [x for x in blockers(self.store, t)]
+                unb = waiting_on(self.store, t)
+                line = "%s  needs %d open%s  unblocks %d direct, %d in all%s" % (
+                    clip(t["title"], 40), len(need), (": " + ", ".join(clip(x["title"], 18) for x in need[:3])) if need else "",
+                    len(unb), g["dependents"].get(t["id"], 0), "  on the critical path" if t["id"] in g["crit"] else "")
+                self.put(H - 3, 2, line, self.attr("fg"), W - 4)
+                if g["bott"] == t["id"]:
+                    self.put(H - 2, 2, "finishing this one unblocks the most work", self.attr("ok", bold=True), W - 4)
+            self.screen_foot(H, W, "j/k same column  h/l prerequisite or next  enter show in list  d done tasks  q close")
+            del tasks_open
+
+        def move(dkey):
+            pos = S["pos"]
+            cur = pos.get(S["sel"])
+            if not cur:
+                return
+            if dkey in ("j", "k"):
+                col = sorted((n["y"], k) for k, n in pos.items() if n["layer"] == cur["layer"])
+                ids = [k for _y, k in col]
+                i = ids.index(S["sel"]) + (1 if dkey == "j" else -1)
+                if 0 <= i < len(ids):
+                    S["sel"] = ids[i]
+                return
+            t = self.store.get(S["sel"])
+            if dkey == "h":
+                cand = [d for d in t.get("deps", []) if d in pos]
+            else:
+                cand = [o["id"] for o in waiting_on(self.store, t) if o["id"] in pos]
+            if cand:
+                S["sel"] = min(cand, key=lambda k: abs(pos[k]["y"] - cur["y"]))
+
+        def handle(name, ch):
+            if name in ("q", "esc", "ctrl-c") or self.keymap.get(name) == "graph":
+                return True
+            if name in ("j", "k", "h", "l", "down", "up", "left", "right"):
+                move({"down": "j", "up": "k", "left": "h", "right": "l"}.get(name, name))
+            elif name == "d":
+                S["show_done"] = not S["show_done"]
+                build()
+            elif name == "enter" and S["sel"]:
+                self.jump_to(S["sel"])
+                return True
+            return False
+
+        self.screen_loop(render, handle)
+
+    # ----- time travel through the data repository -----
+
+    def act_travel(self):
+        if not self.sync.enabled():
+            if self.confirm("data is not tracked in git yet. start tracking it now?"):
+                self.act_sync_setup()
+                self.say("make some changes, then open time travel again", "dim", 5)
+            return
+        fname = os.path.basename(self.store.path)
+        self.sync.finish(3.0)
+        versions = data_versions(self.sync.dir, fname)
+        if not versions:
+            self.say("no history in git yet", "dim")
+            return
+        S = {"v": 0, "tab": 0, "i": 0, "focus": "versions", "cache": {}}
+        tabs = ["deleted", "changed", "added"]
+
+        def version():
+            return versions[max(0, min(S["v"], len(versions) - 1))]
+
+        def old_data():
+            v = version()
+            if v["sha"] not in S["cache"]:
+                S["cache"][v["sha"]] = data_at(self.sync.dir, v["sha"], fname)
+            return S["cache"][v["sha"]]
+
+        def diff():
+            d = old_data()
+            if d is None:
+                return None
+            return version_diff(filled_tasks(d), self.store)
+
+        def items(df):
+            if df is None:
+                return []
+            return df[tabs[S["tab"]]]
+
+        def render():
+            H, W = self.scr.getmaxyx()
+            self.scr.erase()
+            self.screen_bar(W, "time travel", "%d versions " % len(versions))
+            lw = min(44, max(26, W // 3))
+            room = max(1, H - 4)
+            S["v"] = max(0, min(S["v"], len(versions) - 1))
+            top = max(0, min(S["v"] - room // 2, max(0, len(versions) - room)))
+            for r in range(room):
+                k = top + r
+                if k >= len(versions):
+                    break
+                v = versions[k]
+                on = k == S["v"]
+                bg = "sel_bg" if on else "bg"
+                self.fill(1 + r, 0, lw, self.attr("fg", bg))
+                stamp = v["when"][5:16].replace("T", " ")
+                x = self.put(1 + r, 1, stamp, self.attr("accent" if on and S["focus"] == "versions" else "dim", bg, bold=on))
+                self.put(1 + r, x + 1, v["subject"].replace("synth: ", ""), self.attr("fg", bg, bold=on), lw - x - 1)
+            for r in range(H - 2):
+                self.put(1 + r, lw, self.sym["vline"], self.attr("border"))
+            df = diff()
+            rx = lw + 2
+            x = rx
+            for n, nm in enumerate(tabs):
+                cnt = len(df[nm]) if df else 0
+                on = n == S["tab"]
+                label = " %s %d " % (nm, cnt)
+                x = self.put(1, x, label, self.attr("accent" if on else "dim", "sel_bg" if on else "bg", bold=on)) + 1
+            self.put(2, rx, {"deleted": "in that version, gone now. enter restores one, a restores all",
+                              "changed": "different now. enter puts back how it was",
+                              "added": "created after that version (read only)"}[tabs[S["tab"]]], self.attr("dim"), W - rx - 1)
+            lst = items(df)
+            S["i"] = max(0, min(S["i"], len(lst) - 1))
+            room2 = max(1, H - 6)
+            top2 = max(0, min(S["i"] - room2 + 1, max(0, len(lst) - room2))) if S["i"] >= room2 else 0
+            if df is None:
+                self.put(4, rx, "could not read that version", self.attr("err"))
+            elif not lst:
+                self.put(4, rx, "nothing here", self.attr("dim"))
+            for r in range(room2):
+                k = top2 + r
+                if k >= len(lst):
+                    break
+                it = lst[k]
+                on = k == S["i"] and S["focus"] == "items"
+                bg = "sel_bg" if on else "bg"
+                self.fill(4 + r, rx - 1, W - rx, self.attr("fg", bg))
+                if tabs[S["tab"]] == "changed":
+                    old, now_, d = it
+                    x2 = self.put(4 + r, rx, clip(now_["title"], 30), self.attr("fg", bg, bold=on))
+                    self.put(4 + r, x2 + 2, "; ".join("%s %s" % (HIST_LABEL.get(a, a), b) for a, b in d if a not in ("title",)) or "renamed",
+                             self.attr("dim", bg), W - x2 - 4)
+                else:
+                    t = it
+                    x2 = self.put(4 + r, rx, ("%s " % (self.sym["check_on"] if t["done"] else self.sym["check_off"])), self.attr("done" if t["done"] else "accent2", bg))
+                    self.put(4 + r, x2, t["title"] + (("  @" + t["project"]) if t["project"] else ""), self.attr("fg", bg, bold=on), W - x2 - 2)
+            hint = "j/k  tab switch list  h/l focus  R restore this whole version  q close" if S["focus"] == "versions" else "j/k  enter restore  a restore all  tab next list  h back  q close"
+            self.screen_foot(H, W, hint)
+
+        def restore_deleted(tasks):
+            have = {t["id"] for t in self.store.tasks}
+            with self.edit():
+                for t in tasks:
+                    if t["id"] in have:
+                        continue
+                    nt = copy.deepcopy(t)
+                    if nt["parent"] not in have:
+                        nt["parent"] = None
+                    nt["deps"] = [d for d in nt.get("deps", []) if d in have]
+                    self.store.tasks.append(nt)
+                    have.add(nt["id"])
+                    self.store.next_id = max(self.store.next_id, nt["id"] + 1)
+            self.say("restored %d task%s" % (len(tasks), "" if len(tasks) == 1 else "s"), "ok")
+
+        def handle(name, ch):
+            if name in ("q", "esc", "ctrl-c") or self.keymap.get(name) == "travel":
+                return True
+            df = diff()
+            lst = items(df)
+            if name == "tab":
+                S["tab"] = (S["tab"] + 1) % 3
+                S["i"] = 0
+                S["focus"] = "items"
+            elif name in ("shift-tab",):
+                S["tab"] = (S["tab"] - 1) % 3
+                S["i"] = 0
+                S["focus"] = "items"
+            elif name in ("l", "right") and S["focus"] == "versions":
+                S["focus"] = "items"
+            elif name in ("h", "left"):
+                S["focus"] = "versions"
+            elif name in ("j", "down"):
+                if S["focus"] == "versions":
+                    S["v"] += 1
+                    S["i"] = 0
+                else:
+                    S["i"] += 1
+            elif name in ("k", "up"):
+                if S["focus"] == "versions":
+                    S["v"] -= 1
+                    S["i"] = 0
+                else:
+                    S["i"] -= 1
+            elif name == "R":
+                d = old_data()
+                if d and self.confirm("replace your whole list with the version from %s?" % version()["when"][:16].replace("T", " ")):
+                    with self.edit():
+                        self.store.tasks = filled_tasks(d)
+                        self.store.next_id = max([self.store.next_id, d.get("next_id", 1)] + [t["id"] + 1 for t in self.store.tasks])
+                        self.store.done_log = d.get("done_log", [])
+                        self.store.habits = d.get("habits", [])
+                        self.store.projects = d.get("projects", {})
+                        self.store.journal = d.get("journal", {})
+                        self.store.goals = d.get("goals", [])
+                    self.say("restored that version (undo with u)", "ok", 5)
+                    return True
+            elif S["focus"] == "items" and lst:
+                kind = tabs[S["tab"]]
+                it = lst[max(0, min(S["i"], len(lst) - 1))]
+                if name == "enter" and kind == "deleted":
+                    restore_deleted([it])
+                elif name == "a" and kind == "deleted":
+                    restore_deleted(list(lst))
+                elif name == "enter" and kind == "changed":
+                    old, now_, d = it
+                    with self.edit():
+                        for f in RESTORE_FIELDS:
+                            now_[f] = copy.deepcopy(old.get(f))
+                    self.say("put back how it was", "ok")
             return False
 
         self.screen_loop(render, handle)
@@ -8495,6 +10214,11 @@ class App:
             "changes": self.act_changes,
             "git": self.act_git,
             "review": self.act_review,
+            "bulk": self.act_bulk,
+            "dump": self.act_dump,
+            "whatnow": self.act_whatnow,
+            "graph": self.act_graph,
+            "travel": self.act_travel,
             "calendar": self.act_calendar,
             "note_add": self.act_note_add,
             "deps": self.act_deps,
@@ -8579,6 +10303,7 @@ class App:
         while self.running:
             self.wake_check()
             self.git_apply()
+            self.ics_poll()
             self.draw()
             name, _ = self.read_key()
             self.dispatch(name)
@@ -8598,6 +10323,9 @@ class App:
 
 
 def main(argv=None):
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if raw and raw[0] == "add":
+        return cli_add(raw[1:])
     ap = argparse.ArgumentParser(prog="synth", description="synth. a fullscreen terminal todo list")
     ap.add_argument("--data", help="path to the todos json file")
     ap.add_argument("--config", help="path to the config toml")
