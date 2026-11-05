@@ -6,6 +6,7 @@ Config lives in ~/.config/synth/config.toml, data in ~/.local/share/synth.
 """
 
 import argparse
+import base64
 import collections
 import contextlib
 import copy
@@ -19,6 +20,7 @@ import re
 import select
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -26,6 +28,11 @@ import threading
 import textwrap
 import time
 import unicodedata
+
+try:
+    import ssl
+except ImportError:  # a Python built without TLS can still run synth
+    ssl = None
 
 try:
     import tomllib
@@ -126,6 +133,7 @@ DEFAULT_KEYS = {
     "duplicate": ["alt-y"],
     "yank": ["y"],
     "settings": [","],
+    "irc": ["ctrl-k"],
 }
 
 ACTION_DOC = {
@@ -187,6 +195,7 @@ ACTION_DOC = {
     "habits": "habit tracker",
     "changes": "what changed (timeline of edits)",
     "git": "git menu: TODOs, branches, commits, data sync",
+    "irc": "IRC chat, talk while you work",
     "review": "weekly review",
     "bulk": "bulk edit the selection",
     "dump": "brain dump: paste notes, review, import as tasks",
@@ -257,7 +266,7 @@ DEFAULTS = {
     "review_nudge": True,
     "header_clock": False,
     "header_left": ["app", "view", "sort", "query", "selection"],
-    "header_right": ["timer", "overdue", "momentum", "habits", "clock", "progress"],
+    "header_right": ["timer", "irc", "overdue", "momentum", "habits", "clock", "progress"],
     "header_style": "plain",
     "header_text": "",
     "clock_12h": False,
@@ -284,6 +293,13 @@ DEFAULTS = {
     "strings": {},
     "actions": [],
     "templates": [],
+    "irc_networks": [],
+    "irc_dock": False,
+    "irc_dock_lines": 4,
+    "irc_show_joins": True,
+    "irc_nick_colors": True,
+    "irc_time": "%H:%M",
+    "irc_bell": True,
     "hints": [],
     "include": [],
     "detail_tab": "notes",
@@ -304,6 +320,7 @@ STR_OPTS = {
     "start_screen": ["list", "journal", "habits", "projects", "stats", "calendar", "agenda"],
     "detail_tab": ["notes", "info", "links", "history"],
     "note_stamp": None,
+    "irc_time": None,
     "clock_format": None,
     "header_style": ["plain", "divided", "pills"],
     "header_text": None,
@@ -311,11 +328,11 @@ STR_OPTS = {
 }
 
 SORTS = ["manual", "priority", "due", "created", "alpha"]  # custom sorts are added from [sorts]
-BOOL_OPTS = ["sync_output", "git_sync", "git_push", "git_auto_done", "review_nudge", "clock_12h", "clock_seconds", "header_momentum", "history", "snooze_hide", "notes_inline", "header_habits", "header_clock", "header_progress", "header_info",
+BOOL_OPTS = ["sync_output", "git_sync", "git_push", "git_auto_done", "review_nudge", "clock_12h", "clock_seconds", "header_momentum", "history", "snooze_hide", "notes_inline", "header_habits", "header_clock", "header_progress", "header_info", "irc_dock", "irc_show_joins", "irc_nick_colors", "irc_bell",
              "sidebar_counts", "mouse",
              "sidebar", "ascii", "transparent", "exact_colors", "animations", "show_done", "cascade_done",
              "confirm_delete", "focus_auto", "focus_bell"]
-INT_OPTS = ["ics_refresh", "git_commit_delay", "git_refresh", "indent", "sidebar_width", "detail_size", "scrolloff", "focus_work", "focus_break", "focus_long", "focus_rounds"]
+INT_OPTS = ["irc_dock_lines", "ics_refresh", "git_commit_delay", "git_refresh", "indent", "sidebar_width", "detail_size", "scrolloff", "focus_work", "focus_break", "focus_long", "focus_rounds"]
 FLOAT_OPTS = ["anim_speed"]
 
 UNICODE_SYMBOLS = {
@@ -557,7 +574,7 @@ CONFIG_TEMPLATE = """\
 # header_momentum = true     # streak and weekly trend in the header
 # history = true             # record a per-task timeline of changes
 # header_left = ["app", "view", "sort", "query", "selection"]   # top bar widgets, left side
-# header_right = ["timer", "overdue", "momentum", "habits", "clock", "progress"]
+# header_right = ["timer", "irc", "overdue", "momentum", "habits", "clock", "progress"]
 #   widgets: app view sort query selection timer progress momentum habits clock date open overdue due_today greeting week text
 # header_style = "plain"     # plain, divided, pills
 # header_text = ""           # shown by the text widget
@@ -2388,6 +2405,676 @@ def change_summary(lines):
     return "synth: %d changes\n\n%s" % (len(lines), "\n".join("- " + x for x in lines[:40]))
 
 
+# ---------------------------------------------------------------------------
+# IRC client (protocol layer, no curses in here)
+# ---------------------------------------------------------------------------
+
+IRC_MAX_LINES = 500
+IRC_CAPS = ("server-time", "multi-prefix", "sasl")
+IRC_SERVER = "*"  # buffer key of the server buffer
+
+
+def irc_parse(line):
+    """Parse one raw IRC line into a dict: tags, nick, user, host, prefix, cmd, params."""
+    out = {"tags": {}, "nick": "", "user": "", "host": "", "prefix": "", "cmd": "", "params": []}
+    line = line.rstrip("\r\n")
+    if line.startswith("@"):
+        raw, _, line = line.partition(" ")
+        for item in raw[1:].split(";"):
+            k, _, v = item.partition("=")
+            out["tags"][k] = (v.replace("\\:", ";").replace("\\s", " ").replace("\\\\", "\\")
+                              .replace("\\r", "\r").replace("\\n", "\n"))
+    line = line.lstrip(" ")
+    if line.startswith(":"):
+        pre, _, line = line.partition(" ")
+        pre = pre[1:]
+        out["prefix"] = pre
+        nick, _, rest = pre.partition("!")
+        user, _, host = rest.partition("@")
+        if not rest and "@" in pre:
+            nick, _, host = pre.partition("@")
+        out["nick"], out["user"], out["host"] = nick, user, host
+    line = line.lstrip(" ")
+    head, sep, trailing = line.partition(" :")
+    parts = head.split()
+    if not parts and not sep:
+        return out
+    out["cmd"] = parts[0].upper() if parts else ""
+    out["params"] = parts[1:] + ([trailing] if sep else [])
+    return out
+
+
+def irc_clean(text):
+    """Remove characters that would let user text break out of a protocol line."""
+    return text.replace("\r", " ").replace("\n", " ").replace("\0", "")
+
+
+def irc_sasl_plain(account, password):
+    """AUTHENTICATE payload chunks for SASL PLAIN (400 characters each, a final + if exact)."""
+    raw = ("\0%s\0%s" % (account, password)).encode("utf-8")
+    b = base64.b64encode(raw).decode("ascii")
+    chunks = [b[i:i + 400] for i in range(0, len(b), 400)] or ["+"]
+    if len(b) % 400 == 0 and b:
+        chunks.append("+")
+    return chunks
+
+
+def irc_split(text, limit=400):
+    """Split text into pieces of at most limit bytes, preferring spaces, never inside a character."""
+    out = []
+    text = irc_clean(text)
+    while len(text.encode("utf-8")) > limit:
+        cut = len(text)
+        while len(text[:cut].encode("utf-8")) > limit:
+            cut -= 1
+        sp = text.rfind(" ", 0, cut)
+        if sp > cut // 2:
+            cut = sp
+        out.append(text[:cut].rstrip())
+        text = text[cut:].lstrip()
+    if text or not out:
+        out.append(text)
+    return [p.strip() for p in out if p.strip()]
+
+
+def irc_mentioned(text, nick):
+    if not nick:
+        return False
+    return re.search(r"(?<![\w\-\[\]\\`^{}|])" + re.escape(nick) + r"(?![\w\-\[\]\\`^{}|])", text, re.I) is not None
+
+
+def irc_color_index(nick, n):
+    h = 0
+    for ch in nick.lower():
+        h = (h * 31 + ord(ch)) & 0xFFFFFF
+    return h % max(1, n)
+
+
+def irc_strip_format(text):
+    """Remove mIRC colour and style codes."""
+    text = re.sub(r"\x03(\d{1,2}(,\d{1,2})?)?", "", text)
+    text = re.sub(r"\x04[0-9A-Fa-f]{0,6}(,[0-9A-Fa-f]{6})?", "", text)
+    return re.sub(r"[\x02\x0f\x11\x16\x1d\x1e\x1f]", "", text)
+
+
+def irc_server_time(tag):
+    try:
+        d = dt.datetime.strptime(tag[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=dt.timezone.utc)
+        return d.timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def irc_env_name(name):
+    return "SYNTH_IRC_PASSWORD_" + re.sub(r"[^A-Za-z0-9]", "_", name or "").upper()
+
+
+class IrcBuffer:
+    def __init__(self, name, kind):
+        self.name, self.kind = name, kind  # kind: server, channel, query
+        self.lines = collections.deque(maxlen=IRC_MAX_LINES)
+        self.unread = 0
+        self.mentions = 0
+        self.topic = ""
+        self.nicks = {}
+        self.joined = False
+        self.want = False
+
+
+class IrcClient:
+    """One connection. A reader thread fills buffers; the UI reads them under client.lock."""
+
+    def __init__(self, cfg, password=None, opener=None):
+        self.cfg = dict(cfg)
+        self.name = self.cfg.get("name") or self.cfg.get("host") or "irc"
+        self.password = password
+        self.lock = threading.RLock()
+        self.send_lock = threading.Lock()
+        self.buffers = collections.OrderedDict()
+        self.status = "offline"
+        self.nick = self.cfg.get("nick") or "synth"
+        self.rev = 0
+        self.alerts = collections.deque(maxlen=50)
+        self.viewing = None
+        self.sock = None
+        self.thread = None
+        self.stop_ev = threading.Event()
+        self.opener = opener
+        self.prefix_modes, self.prefix_chars = "ov", "@+"
+        self.chantypes = "#&"
+        self.chanmodes = ["beI", "k", "l", "imnpst"]
+        self.caps_ls = set()
+        self.sasl_state = None
+        self.autojoined = False
+        self.reply_ctx = IRC_SERVER
+        self.last_rx = time.time()
+        self.buf(IRC_SERVER, "server")
+
+    # ----- buffers -----
+
+    def buf(self, name, kind=None):
+        key = IRC_SERVER if name == IRC_SERVER else name.lower()
+        with self.lock:
+            b = self.buffers.get(key)
+            if b is None:
+                if kind is None:
+                    kind = "channel" if name[:1] in self.chantypes else "query"
+                b = self.buffers[key] = IrcBuffer(name, kind)
+                if key != IRC_SERVER:
+                    self.buffers.move_to_end(key)
+            return b
+
+    def add(self, key, kind, nick, text, ts=None, hl=False):
+        with self.lock:
+            b = self.buf(key)
+            b.lines.append((ts or time.time(), kind, nick, text))
+            watching = self.viewing == (IRC_SERVER if key == IRC_SERVER else key.lower())
+            if not watching and kind in ("msg", "action", "notice"):
+                b.unread += 1
+                if hl:
+                    b.mentions += 1
+            if hl and not watching:
+                self.alerts.append((self.name, b.name, nick, text))
+            self.rev += 1
+
+    def info(self, text, key=IRC_SERVER, kind="info"):
+        self.add(key, kind, "", text)
+
+    def view(self, key):
+        with self.lock:
+            self.viewing = key
+            b = self.buffers.get(key)
+            if b:
+                b.unread = b.mentions = 0
+            self.rev += 1
+
+    def totals(self):
+        with self.lock:
+            return (sum(b.unread for b in self.buffers.values()),
+                    sum(b.mentions for b in self.buffers.values()))
+
+    # ----- connection -----
+
+    def start(self):
+        if self.thread and self.thread.is_alive():
+            return
+        self.stop_ev.clear()
+        self.thread = threading.Thread(target=self._run, daemon=True, name="irc-" + self.name)
+        self.thread.start()
+
+    def stop(self, message="synth"):
+        self.stop_ev.set()
+        with contextlib.suppress(Exception):
+            self.send("QUIT :" + irc_clean(message))
+        s = self.sock
+        if s is not None:
+            with contextlib.suppress(Exception):
+                time.sleep(0.15)
+                s.close()
+        if self.thread and self.thread is not threading.current_thread():
+            self.thread.join(1.5)
+        self.status = "offline"
+        self.rev += 1
+
+    def _open(self):
+        if self.opener:
+            return self.opener(self.cfg)
+        host = self.cfg.get("host", "")
+        port = int(self.cfg.get("port") or (6697 if self.cfg.get("tls", True) else 6667))
+        raw = socket.create_connection((host, port), timeout=20)
+        if not self.cfg.get("tls", True):
+            return raw
+        if ssl is None:
+            raise OSError("this Python has no ssl module")
+        ctx = ssl.create_default_context()
+        if not self.cfg.get("verify", True):
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        return ctx.wrap_socket(raw, server_hostname=host)
+
+    def _run(self):
+        delay = 5
+        while not self.stop_ev.is_set():
+            started = time.time()
+            try:
+                self._session()
+            except Exception as e:  # network errors, TLS errors, anything
+                self.info("connection failed: %s" % (str(e) or e.__class__.__name__), kind="error")
+            self.status = "offline"
+            self.sock = None
+            with self.lock:
+                for b in self.buffers.values():
+                    b.joined = False
+                self.rev += 1
+            if self.stop_ev.is_set() or not self.cfg.get("reconnect", True):
+                break
+            delay = 5 if time.time() - started > 60 else min(120, delay * 2)
+            self.info("reconnecting in %ds" % delay)
+            if self.stop_ev.wait(delay):
+                break
+
+    def _creds_ok(self):
+        if self.cfg.get("auth", "sasl") == "none" or not self.password:
+            return False
+        if not self.cfg.get("tls", True) and not self.cfg.get("plain_auth"):
+            return False
+        return True
+
+    def _session(self):
+        self.status = "connecting"
+        self.sasl_state = None
+        self.autojoined = False
+        self.caps_ls = set()
+        self.nick = self.cfg.get("nick") or "synth"
+        self.rev += 1
+        self.info("connecting to %s" % self.cfg.get("host", ""))
+        sock = self._open()
+        sock.settimeout(30)
+        self.sock = sock
+        self.last_rx = time.time()
+        self.status = "registering"
+        if self.cfg.get("auth", "sasl") != "none" and self.password and not self._creds_ok():
+            self.info("password not sent: this network is not using TLS", kind="error")
+        self.send("CAP LS 302")
+        self.send("NICK " + self.nick)
+        user = re.sub(r"[^\w\-.]", "", self.cfg.get("user") or self.nick) or "synth"
+        real = irc_clean(self.cfg.get("realname") or "synth")
+        self.send("USER %s 0 * :%s" % (user, real))
+        data = b""
+        while not self.stop_ev.is_set():
+            try:
+                chunk = sock.recv(4096)
+            except socket.timeout:
+                idle = time.time() - self.last_rx
+                if idle > 300:
+                    raise OSError("ping timeout")
+                if idle > 120:
+                    self.send("PING :synth")
+                continue
+            if not chunk:
+                self.info("disconnected")
+                return
+            self.last_rx = time.time()
+            data += chunk
+            while b"\n" in data:
+                raw, _, data = data.partition(b"\n")
+                line = raw.decode("utf-8", "replace").rstrip("\r")
+                if line:
+                    try:
+                        self.handle(line)
+                    except Exception as e:
+                        self.info("protocol error: %s" % e, kind="error")
+            if len(data) > 65536:
+                raise OSError("line too long")
+
+    # ----- sending -----
+
+    def send(self, line):
+        line = irc_clean(line)
+        raw = line.encode("utf-8")[:510] + b"\r\n"
+        s = self.sock
+        if s is None:
+            return False
+        try:
+            with self.send_lock:
+                s.sendall(raw)
+            return True
+        except OSError:
+            return False
+
+    def privmsg(self, key, text, action=False):
+        """Send text to a buffer's target, splitting long text; echoes into the buffer."""
+        b = self.buffers.get(key)
+        if b is None or b.kind == "server":
+            return "not in a channel or query; use /join or /msg"
+        if self.status != "online":
+            return "not connected"
+        for piece in irc_split(text):
+            if action:
+                self.send("PRIVMSG %s :\x01ACTION %s\x01" % (b.name, piece))
+                self.add(key, "action", self.nick, piece)
+            else:
+                self.send("PRIVMSG %s :%s" % (b.name, piece))
+                self.add(key, "own", self.nick, piece)
+        return None
+
+    def command(self, key, text):
+        """Run a protocol level slash command. Returns (error or None, buffer key to switch to or None)."""
+        cmd, _, rest = text.lstrip("/").partition(" ")
+        cmd, rest = cmd.lower(), rest.strip()
+        if cmd in ("join", "j"):
+            if not rest:
+                return "usage: /join #channel [key]", None
+            first = rest.split()[0]
+            if first[:1] not in self.chantypes:
+                rest = "#" + rest
+                first = rest.split()[0]
+            self.send("JOIN " + rest)
+            b = self.buf(first, "channel")
+            b.want = True
+            return None, first.lower()
+        if cmd in ("part", "leave"):
+            b = self.buffers.get(key)
+            if not b or b.kind != "channel":
+                return "not in a channel", None
+            b.want = False
+            self.send("PART %s :%s" % (b.name, irc_clean(rest or "bye")))
+            return None, None
+        if cmd in ("msg", "m", "query", "q"):
+            target, _, body = rest.partition(" ")
+            if not target:
+                return "usage: /msg nick text", None
+            b = self.buf(target)
+            if body.strip():
+                err = self.privmsg(b.name.lower(), body.strip())
+                if err:
+                    return err, None
+            return None, b.name.lower()
+        if cmd in ("me", "action"):
+            return self.privmsg(key, rest, action=True), None
+        if cmd == "nick":
+            if not rest:
+                return "usage: /nick newnick", None
+            self.send("NICK " + rest.split()[0])
+            return None, None
+        if cmd == "topic":
+            b = self.buffers.get(key)
+            if not b or b.kind != "channel":
+                return "not in a channel", None
+            self.send("TOPIC %s :%s" % (b.name, rest) if rest else "TOPIC " + b.name)
+            return None, None
+        if cmd == "names":
+            b = self.buffers.get(key)
+            if b and b.kind == "channel":
+                self.send("NAMES " + b.name)
+            return None, None
+        if cmd == "whois":
+            if not rest:
+                return "usage: /whois nick", None
+            self.reply_ctx = key
+            self.send("WHOIS " + rest.split()[0])
+            return None, None
+        if cmd in ("raw", "quote"):
+            self.send(rest)
+            return None, None
+        if cmd in ("ns", "nickserv", "cs", "chanserv", "hs", "bs", "memoserv", "ms"):
+            svc = {"ns": "NickServ", "cs": "ChanServ", "hs": "HostServ", "bs": "BotServ", "ms": "MemoServ", "memoserv": "MemoServ"}.get(cmd, cmd.capitalize())
+            if not rest:
+                return "usage: /%s command" % cmd, None
+            self.send("PRIVMSG %s :%s" % (svc, rest))  # never echoed, it may hold a password
+            self.info("sent to %s" % svc)
+            return None, IRC_SERVER
+        if cmd == "identify":
+            if not rest:
+                return "usage: /identify password", None
+            self.send("PRIVMSG NickServ :IDENTIFY %s" % rest)
+            self.info("sent to NickServ")
+            return None, IRC_SERVER
+        if cmd == "away":
+            self.send("AWAY :" + rest if rest else "AWAY")
+            return None, None
+        return "unknown command: /" + cmd, None
+
+    # ----- receiving -----
+
+    def _autojoin(self):
+        if self.autojoined or self.status != "online":
+            return
+        self.autojoined = True
+        names = []
+        for c in self.cfg.get("channels") or []:
+            c = str(c).strip()
+            if c:
+                names.append(c)
+        with self.lock:
+            for b in self.buffers.values():
+                if b.kind == "channel" and b.want and not any(n.split()[0].lower() == b.name.lower() for n in names):
+                    names.append(b.name)
+        for n in names:
+            if n[:1] not in self.chantypes:
+                n = "#" + n
+            self.send("JOIN " + n)
+            self.buf(n.split()[0], "channel").want = True
+
+    def _finish_caps(self):
+        self.send("CAP END")
+
+    def handle(self, line):
+        m = irc_parse(line)
+        cmd, p = m["cmd"], m["params"]
+        ts = irc_server_time(m["tags"].get("time", "")) if "time" in m["tags"] else None
+        me = self.nick
+        if cmd == "PING":
+            self.send("PONG :" + (p[0] if p else ""))
+        elif cmd == "CAP":
+            self._cap(p)
+        elif cmd == "AUTHENTICATE":
+            if p and p[0] == "+" and self.sasl_state == "auth":
+                acct = self.cfg.get("account") or self.cfg.get("nick") or self.nick
+                for chunk in irc_sasl_plain(acct, self.password or ""):
+                    self.send("AUTHENTICATE " + chunk)
+        elif cmd == "900":
+            self.info("logged in as %s" % (p[2] if len(p) > 2 else "?"))
+        elif cmd == "903":
+            self.sasl_state = "done"
+            self.info("SASL login ok")
+            self._finish_caps()
+        elif cmd in ("902", "904", "905", "906", "907"):
+            self.sasl_state = "failed"
+            self.info("SASL login failed (%s). Check your account name and password." % cmd, kind="error")
+            self._finish_caps()
+        elif cmd == "001":
+            self.status = "online"
+            if p:
+                self.nick = p[0]
+            self.info(p[-1] if p else "connected")
+            self.rev += 1
+            auth = self.cfg.get("auth", "sasl")
+            need_ns = auth == "nickserv" or (auth == "sasl" and self.sasl_state is None)
+            if need_ns and self._creds_ok():
+                acct = self.cfg.get("account") or self.nick
+                self.send("PRIVMSG NickServ :IDENTIFY %s %s" % (acct, self.password))
+                self.info("identifying with NickServ")
+                threading.Timer(3.0, self._autojoin).start()
+            else:
+                self._autojoin()
+        elif cmd == "005":
+            for tok in p[1:-1]:
+                k, _, v = tok.partition("=")
+                if k == "PREFIX":
+                    mm = re.match(r"\(([^)]*)\)(.*)", v)
+                    if mm and len(mm.group(1)) == len(mm.group(2)):
+                        self.prefix_modes, self.prefix_chars = mm.group(1), mm.group(2)
+                elif k == "CHANTYPES" and v:
+                    self.chantypes = v
+                elif k == "CHANMODES":
+                    self.chanmodes = (v.split(",") + ["", "", "", ""])[:4]
+        elif cmd == "433" and self.status != "online":
+            self.nick = self.nick + "_"
+            self.send("NICK " + self.nick)
+        elif cmd == "353" and len(p) >= 4:
+            b = self.buf(p[2], "channel")
+            with self.lock:
+                for n in p[3].split():
+                    pre = ""
+                    while n and n[0] in self.prefix_chars:
+                        pre += n[0]
+                        n = n[1:]
+                    if n:
+                        b.nicks[n] = pre[:1]
+                self.rev += 1
+        elif cmd == "332" and len(p) >= 3:
+            b = self.buf(p[1], "channel")
+            b.topic = p[2]
+            self.add(p[1].lower(), "info", "", "topic: " + irc_strip_format(p[2]))
+        elif cmd == "TOPIC" and p:
+            b = self.buf(p[0], "channel")
+            b.topic = p[1] if len(p) > 1 else ""
+            self.add(p[0].lower(), "info", "", "%s set the topic: %s" % (m["nick"], irc_strip_format(b.topic)), ts)
+        elif cmd == "JOIN" and p:
+            chan = p[0]
+            b = self.buf(chan, "channel")
+            if m["nick"].lower() == me.lower():
+                b.joined, b.want = True, True
+                b.nicks = {}
+                self.add(chan.lower(), "join", m["nick"], "you joined " + chan, ts)
+            else:
+                b.nicks[m["nick"]] = ""
+                self.add(chan.lower(), "join", m["nick"], "%s joined" % m["nick"], ts)
+        elif cmd == "PART" and p:
+            b = self.buf(p[0], "channel")
+            if m["nick"].lower() == me.lower():
+                b.joined = False
+                b.nicks = {}
+                self.add(p[0].lower(), "part", m["nick"], "you left " + p[0], ts)
+            else:
+                b.nicks.pop(m["nick"], None)
+                self.add(p[0].lower(), "part", m["nick"], "%s left%s" % (m["nick"], (": " + p[1]) if len(p) > 1 and p[1] else ""), ts)
+        elif cmd == "KICK" and len(p) >= 2:
+            b = self.buf(p[0], "channel")
+            b.nicks.pop(p[1], None)
+            if p[1].lower() == me.lower():
+                b.joined = False
+            self.add(p[0].lower(), "part", m["nick"], "%s kicked %s%s" % (m["nick"], p[1], (": " + p[2]) if len(p) > 2 else ""), ts)
+        elif cmd == "QUIT":
+            with self.lock:
+                for k, b in list(self.buffers.items()):
+                    if m["nick"] in b.nicks:
+                        b.nicks.pop(m["nick"], None)
+                        self.add(k, "part", m["nick"], "%s quit%s" % (m["nick"], (": " + p[0]) if p and p[0] else ""), ts)
+        elif cmd == "NICK" and p:
+            new = p[0]
+            if m["nick"].lower() == me.lower():
+                self.nick = new
+            with self.lock:
+                for k, b in list(self.buffers.items()):
+                    if m["nick"] in b.nicks:
+                        b.nicks[new] = b.nicks.pop(m["nick"])
+                        self.add(k, "info", "", "%s is now known as %s" % (m["nick"], new), ts)
+                    elif k == m["nick"].lower() and b.kind == "query":
+                        self.add(k, "info", "", "%s is now known as %s" % (m["nick"], new), ts)
+        elif cmd == "MODE" and len(p) >= 2:
+            if p[0][:1] in self.chantypes:
+                self._chan_mode(p, m["nick"], ts)
+            else:
+                self.info("mode %s %s" % (p[0], " ".join(p[1:])))
+        elif cmd in ("PRIVMSG", "NOTICE") and len(p) >= 2:
+            self._message(m, cmd, p[0], p[1], ts)
+        elif cmd == "ERROR":
+            self.info("server error: " + (p[0] if p else ""), kind="error")
+        elif cmd in ("311", "312", "317", "319", "330", "671") and len(p) >= 3:
+            self.add(self.reply_ctx if self.reply_ctx in self.buffers else IRC_SERVER, "info", "", "whois %s: %s" % (p[1], " ".join(irc_strip_format(x) for x in p[2:])))
+        elif cmd in ("318", "366", "333"):
+            pass
+        elif cmd in ("375", "372", "376", "252", "253", "254", "255", "265", "266", "250", "251"):
+            if cmd in ("372", "375", "376") and self.cfg.get("show_motd") is not True:
+                return
+            self.info(" ".join(p[1:]))
+        elif cmd.isdigit() and len(p) >= 2:
+            kind = "error" if cmd[0] in "45" else "info"
+            self.info(" ".join(irc_strip_format(x) for x in p[1:]), kind=kind)
+
+    def _cap(self, p):
+        if len(p) < 2:
+            return
+        sub = p[1].upper()
+        names = p[-1].split() if p else []
+        if sub == "LS":
+            self.caps_ls.update(n.split("=")[0] for n in names)
+            if len(p) > 3 and p[2] == "*":
+                return
+            want = [c for c in IRC_CAPS if c in self.caps_ls and (c != "sasl" or (self.cfg.get("auth", "sasl") == "sasl" and self._creds_ok()))]
+            if want:
+                self.send("CAP REQ :" + " ".join(want))
+            else:
+                self._finish_caps()
+        elif sub == "ACK":
+            if "sasl" in names and self.cfg.get("auth", "sasl") == "sasl" and self._creds_ok():
+                self.sasl_state = "auth"
+                self.send("AUTHENTICATE PLAIN")
+            else:
+                self._finish_caps()
+        elif sub == "NAK":
+            self._finish_caps()
+
+    def _chan_mode(self, p, who, ts):
+        chan, modes, args = p[0], p[1], list(p[2:])
+        b = self.buf(chan, "channel")
+        sign = "+"
+        for ch in modes:
+            if ch in "+-":
+                sign = ch
+                continue
+            if ch in self.prefix_modes:
+                if args:
+                    n = args.pop(0)
+                    sym = self.prefix_chars[self.prefix_modes.index(ch)]
+                    if n in b.nicks:
+                        b.nicks[n] = sym if sign == "+" else ""
+            elif ch in self.chanmodes[0] or ch in self.chanmodes[1] or (sign == "+" and ch in self.chanmodes[2]):
+                if args:
+                    args.pop(0)
+        self.add(chan.lower(), "info", "", "%s sets mode %s" % (who or "server", " ".join(p[1:])), ts)
+
+    def _message(self, m, cmd, target, text, ts):
+        nick = m["nick"] or ""
+        me = self.nick
+        from_server = not m["prefix"] or (not m["user"] and "." in m["prefix"])
+        if text.startswith("\x01") and len(text) > 1:
+            body = text.strip("\x01")
+            word, _, arg = body.partition(" ")
+            word = word.upper()
+            if cmd == "PRIVMSG" and word == "ACTION":
+                key = self._target_key(target, nick)
+                self.add(key, "action", nick, irc_strip_format(arg), ts, hl=self._hl(target, arg))
+            elif cmd == "PRIVMSG" and word == "VERSION":
+                self.send("NOTICE %s :\x01VERSION synth %s\x01" % (nick, VERSION))
+            elif cmd == "PRIVMSG" and word == "PING":
+                self.send("NOTICE %s :\x01PING %s\x01" % (nick, arg))
+            return
+        text = irc_strip_format(text)
+        if cmd == "NOTICE":
+            if from_server or not nick:
+                self.info(text)
+                return
+            key = target.lower() if target[:1] in self.chantypes else (nick.lower() if nick.lower() in self.buffers else IRC_SERVER)
+            self.add(key, "notice", nick, text, ts, hl=False)
+            if nick.lower() == "nickserv" and re.search(r"identified|recogni[sz]ed|logged in", text, re.I):
+                self._autojoin()
+            return
+        key = self._target_key(target, nick)
+        self.add(key, "msg", nick, text, ts, hl=self._hl(target, text))
+
+    def _target_key(self, target, nick):
+        if target[:1] in self.chantypes:
+            self.buf(target, "channel")
+            return target.lower()
+        self.buf(nick, "query")
+        return nick.lower()
+
+    def _hl(self, target, text):
+        return target[:1] not in self.chantypes or irc_mentioned(text, self.nick)
+
+    # ----- helpers for the UI -----
+
+    def nick_list(self, key):
+        with self.lock:
+            b = self.buffers.get(key)
+            if not b:
+                return []
+            order = {c: i for i, c in enumerate(self.prefix_chars)}
+            return sorted(b.nicks.items(), key=lambda kv: (order.get(kv[1], 99) if kv[1] else 98, kv[0].lower()))
+
+    def snapshot(self, key):
+        with self.lock:
+            b = self.buffers.get(key)
+            if not b:
+                return None
+            return {"name": b.name, "kind": b.kind, "topic": b.topic, "lines": list(b.lines),
+                    "nicks": self.nick_list(key), "joined": b.joined}
+
+
+
 class DataSync:
     """Keeps the data folder in a git repository: debounced commits, optional pull and push."""
 
@@ -3165,7 +3852,7 @@ HOOK_EVENTS = {
 STRING_KEYS = {"app_name": "Name shown in the header.", "empty": "Text for an empty list.",
                "add_title": "Title of the add task prompt."}
 HEADER_WIDGETS = ["app", "view", "sort", "query", "selection", "timer", "progress", "momentum", "habits", "clock",
-                  "date", "open", "overdue", "due_today", "greeting", "week", "text", "sync", "event"]
+                  "date", "open", "overdue", "due_today", "greeting", "week", "text", "sync", "event", "irc"]
 COLUMN_CHOICES = ["check", "prio", "id", "title", "est", "tags", "project", "time", "due", "deps", "snooze", "created"]
 SCREEN_CHOICES = ["list", "journal", "habits", "projects", "stats", "calendar", "agenda"]
 ROLE_DOC = {
@@ -3188,6 +3875,12 @@ RECORD_FIELDS = {
                   ("notes", "Notes", "multiline"), ("subtasks", "Subtasks (one per line)", "lines"),
                   ("tags", "Tags", "list"), ("project", "Project", "text"), ("prio", "Priority 0 to 3", "int"),
                   ("est", "Estimate", "text"), ("due", "Due", "text"), ("repeat", "Repeat", "text")],
+    "irc": [("name", "Name", "text"), ("host", "Server", "text"), ("port", "Port (blank for default)", "int"),
+            ("nick", "Nick", "text"), ("auth", "Login method", "choice", ["sasl", "nickserv", "none"]),
+            ("account", "NickServ account", "text"), ("password_cmd", "Password command", "text"),
+            ("channels", "Channels to join", "list"), ("autoconnect", "Connect when synth starts", "bool"),
+            ("insecure", "No TLS (passwords are never sent)", "bool"), ("noverify", "Skip certificate check", "bool"),
+            ("noreconnect", "Do not reconnect", "bool"), ("user", "Username", "text"), ("realname", "Real name", "text")],
     "actions": [("name", "Name", "text"), ("key", "Shortcut key", "text"), ("cmd", "Shell command", "text"),
                 ("mode", "Run mode", "choice", ["bg", "fg", "capture"]), ("confirm", "Ask first", "bool"),
                 ("reload", "Reload tasks after", "bool"), ("pause", "Wait for enter (fg mode)", "bool")],
@@ -3305,6 +3998,19 @@ def build_settings_tree():
         _s("todo_markers", "TODO Markers", "strlist", "Comment markers the TODO scanner looks for, comma separated."),
         _s(None, "Track Data Folder Now", "action", "Run git init in the data folder and start committing.", run="git_setup", button="Set up"),
     ]
+    ircset = [
+        _s("irc_networks", "Networks", "records",
+           "IRC servers. Login is SASL or NickServ with your account. The password is never saved: give a Password command (for example pass show irc/libera), set the SYNTH_IRC_PASSWORD_<NAME> environment variable, or synth asks when you connect.",
+           fields="irc"),
+        _s("irc_dock", "Chat Strip on Main Screen", "bool", "Show the latest chat lines under the task list."),
+        _s("irc_dock_lines", "Chat Strip Lines", "int", "Height of the chat strip.", min=1, max=12),
+        _s("irc_show_joins", "Show Joins and Parts", "bool", "Show who joins, leaves and quits."),
+        _s("irc_nick_colors", "Colored Nicks", "bool", "Give each nick its own color."),
+        _s("irc_time", "Time Format", "text", "strftime format of message times, for example %H:%M or %I:%M %p."),
+        _s("irc_bell", "Ring Bell on Mentions", "bool", "Ring the terminal bell when someone mentions you or sends a private message."),
+        _s(None, "Open IRC", "action", "Open the chat screen.", run="irc_open", button="Open"),
+        _s(None, "Add Libera.Chat", "action", "Set up a network with a few questions.", run="irc_add_libera", button="Add"),
+    ]
     calendar = [
         _s("ics_sources", "Calendar Files", "strlist", "Paths or URLs of .ics calendars (webcal:// works). Events show in the calendar and agenda, the event widget and What Now."),
         _s("ics_refresh", "Refresh Every (minutes)", "int", "How often web calendars are downloaded again.", min=1, max=1440),
@@ -3348,6 +4054,7 @@ def build_settings_tree():
         _node("Notes and Journal", notes),
         _node("Focus", focus),
         _node("Git", gitset),
+        _node("IRC", ircset),
         _node("Weekly Review", review),
         _node("Calendar Events", calendar),
         _node("Keybindings", dyn="keys", blurb="Comma separated keys. Chords like g g work. Type none to unbind."),
@@ -3456,6 +4163,11 @@ class App:
         self.ics_day, self.ics_started, self.ics_next, self.ics_thread = "", False, 0.0, None
         store.on_save = self.on_store_save
         self.anims = {}
+        self.irc = {}
+        self.irc_pw = {}
+        self.irc_sel = ("", IRC_SERVER)
+        self.irc_draft = ""
+        self.irc_hist = []
         self.bar_disp = 0.0
         self.bar_busy = False
         self.jump_stack = []
@@ -4117,7 +4829,7 @@ class App:
     # ----- palette -----
 
     COMMANDS = ["issues", "prs", "settings", "journal", "habits", "projects", "goals", "note", "snooze", "deps", "template", "run", "theme", "sort", "view", "filter", "set", "export", "clear", "reload", "config",
-                "add", "stats", "changes", "review", "git", "todos", "sync", "bulk", "dump", "now", "graph", "travel", "calendar", "agenda", "events", "focus", "track", "find", "links", "help", "quit", "w", "q"]
+                "add", "stats", "changes", "review", "git", "todos", "sync", "bulk", "dump", "now", "graph", "travel", "calendar", "agenda", "events", "focus", "track", "find", "links", "irc", "help", "quit", "w", "q"]
 
     def act_palette(self):
         text = self.prompt(":", "", complete=self.COMMANDS, hist="cmd")
@@ -4190,6 +4902,8 @@ class App:
             self.act_graph()
         elif cmd in ("travel", "timetravel"):
             self.act_travel()
+        elif cmd == "irc":
+            self.act_irc(arg)
         elif cmd == "git":
             self.act_git()
         elif cmd == "todos":
@@ -4422,6 +5136,8 @@ class App:
                 if self.store.changed_on_disk():
                     self.store.load()
                     self.say("reloaded from disk", "dim", 2)
+                if self.irc:
+                    self.irc_poll()
                 return "tick", None
             if k == "\x1b":
                 self.scr.timeout(25)
@@ -4436,7 +5152,7 @@ class App:
 
     # ----- modal widgets -----
 
-    def prompt(self, title, initial="", live=None, complete=None, hist=None):
+    def prompt(self, title, initial="", live=None, complete=None, hist=None, secret=False):
         buf, pos = list(initial), len(initial)
         hl = list(self.state.get("hist", {}).get(hist, [])) if hist else []
         hi = len(hl)
@@ -4449,14 +5165,15 @@ class App:
             self.box(y, x, 4 + len(lines), w, title)
             inner = w - 4
             text = "".join(buf)
+            disp = ["*"] * len(buf) if secret else buf
             start = 0
-            while cell_len("".join(buf[start:pos])) >= inner:
+            while cell_len("".join(disp[start:pos])) >= inner:
                 start += 1
-            shown = "".join(buf[start:])
+            shown = "".join(disp[start:])
             self.fill(y + 1, x + 2, inner, self.attr("fg", "sel_bg"))
             self.put(y + 1, x + 2, shown, self.attr("fg", "sel_bg"), inner)
-            cx = x + 2 + cell_len("".join(buf[start:pos]))
-            under = buf[pos] if pos < len(buf) else " "
+            cx = x + 2 + cell_len("".join(disp[start:pos]))
+            under = disp[pos] if pos < len(disp) else " "
             self.put(y + 1, cx, under, self.attr("fg", "sel_bg", reverse=True))
             for i, (ln, role) in enumerate(lines):
                 self.put(y + 2 + i, x + 2, clip(ln, inner), self.attr(role))
@@ -4627,7 +5344,7 @@ class App:
             ("NOTES, LINKS, PLANNING", ["notes", "note_add", "links", "link_add", "deps", "snooze", "template",
                                         "actions_menu"]),
             ("FILTER AND SORT", ["search", "clear_filter", "sort", "hide_done"]),
-            ("SCREENS AND TOOLS", ["journal", "habits", "projects", "calendar", "stats", "changes", "review", "git", "bulk", "dump", "whatnow", "graph", "travel", "focus_mode", "track",
+            ("SCREENS AND TOOLS", ["journal", "habits", "projects", "calendar", "stats", "changes", "review", "git", "bulk", "dump", "whatnow", "graph", "travel", "focus_mode", "track", "irc",
                                    "theme", "settings", "palette", "help", "quit"]),
         ]
         seen = set()
@@ -4783,6 +5500,17 @@ class App:
             st = self.sync.status
             glyph = {"synced": s["check_on"], "pending": s["bullet"], "conflict": s["blocked"], "error": s["blocked"]}.get(st, s["bullet"])
             return "git %s %s" % (glyph, st), {"synced": "ok", "pending": "accent2"}.get(st, "overdue"), False
+        if name == "irc":
+            on = [c for c in self.irc.values() if c.status == "online"]
+            un = men = 0
+            for c in self.irc.values():
+                a, b = c.totals()
+                un, men = un + a, men + b
+            if men:
+                return "irc @%d" % men, "today", True
+            if un:
+                return "irc %d" % un, "accent2", False
+            return ("irc", "dim", False) if on else None
         if name == "text":
             return (o.get("header_text") or None) and (o["header_text"], "accent2", False)
         return None
@@ -4853,6 +5581,8 @@ class App:
         sw = o["sidebar_width"] if o["sidebar"] and W >= 60 else 0
         list_x = sw + (1 if sw else 0)
         body_y, body_h = 1, H - 2
+        dock = self.irc_dock_rows(W) if H >= 18 else []
+        body_h -= len(dock)
         dw = dh = 0
         if o["detail"] == "right" and W - list_x >= 72:
             dw = min(o["detail_size"], W - list_x - 36)
@@ -4895,6 +5625,9 @@ class App:
             dy = body_y + list_h
             self.put(dy, list_x, s["hline"] * list_w, self.attr("border"))
             self.draw_detail(list_x + 1, dy + 1, list_w - 2, dh)
+
+        for i, (text, role, bold) in enumerate(dock):
+            self.put(H - 1 - len(dock) + i, 0, clip(text, W), self.attr(role, bold=bold), W)
 
         # footer
         fb = self.attr("fg", "bar_bg")
@@ -5354,6 +6087,8 @@ class App:
     def tick_ms(self):
         if self.tick_override is not None:
             return self.tick_override
+        if self.irc and any(c.status != "offline" for c in self.irc.values()):
+            return 500 if not (self.anims or self.bar_busy) else 40
         if not self.opts.get("animations"):
             return 1000
         if self.anims or self.bar_busy:
@@ -7018,6 +7753,640 @@ class App:
                 if handle(name, ch):
                     return
         finally:
+            self.backdrop = self.draw
+            self.tick_override = None
+
+    # ----- IRC -----
+
+    IRC_NICK_ROLES = ["accent", "accent2", "ok", "today", "p1", "p2", "p3", "tag", "project"]
+    IRC_HELP = [
+        "/join #chan   /part   /msg nick text   /me action   /nick NEW   /topic [text]   /names   /whois nick",
+        "/ns, /cs  talk to NickServ or ChanServ (never echoed)   /identify PASSWORD   /away [text]   /raw LINE",
+        "/connect [net]   /disconnect   /close  close this buffer   /next  /prev   /clear   /exit  leave this screen",
+        "/share  send the selected task to this chat   /todo [nick]  make a task from the last message",
+        "/task TEXT  quick add a task (same syntax as the add prompt)   //text  sends a line starting with /",
+        "keys: tab complete nick, ctrl-n / ctrl-p or alt-1..9 switch buffer, pgup / pgdn scroll, esc back to your tasks",
+    ]
+
+    def irc_nets(self):
+        return [n for n in (self.opts.get("irc_networks") or []) if isinstance(n, dict) and n.get("host")]
+
+    def irc_net_cfg(self, rec):
+        tls = not rec.get("insecure")
+        try:
+            port = int(rec.get("port") or 0)
+        except (TypeError, ValueError):
+            port = 0
+        chans = rec.get("channels") or []
+        if isinstance(chans, str):
+            chans = [c.strip() for c in chans.split(",") if c.strip()]
+        auth = rec.get("auth") or ("sasl" if (rec.get("account") or rec.get("password_cmd")) else "none")
+        return {"name": str(rec.get("name") or rec["host"]), "host": str(rec["host"]), "tls": tls,
+                "port": port or (6697 if tls else 6667), "verify": not rec.get("noverify"),
+                "reconnect": not rec.get("noreconnect"),
+                "nick": str(rec.get("nick") or os.environ.get("USER") or "synth"),
+                "user": str(rec.get("user") or ""), "realname": str(rec.get("realname") or "synth user"),
+                "account": str(rec.get("account") or ""), "auth": auth, "channels": list(chans)}
+
+    def irc_password(self, cfg, rec, ask):
+        """Find the password without ever writing it to disk: command, environment, then a masked prompt."""
+        if cfg["auth"] == "none":
+            return None
+        name = cfg["name"]
+        if self.irc_pw.get(name):
+            return self.irc_pw[name]
+        pw = None
+        cmd = rec.get("password_cmd")
+        if cmd:
+            try:
+                r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=15,
+                                   stdin=subprocess.DEVNULL)
+                if r.returncode == 0 and r.stdout.strip():
+                    pw = r.stdout.strip().split("\n")[0]
+                else:
+                    self.say("password command failed", "err")
+            except (OSError, subprocess.SubprocessError):
+                self.say("password command failed", "err")
+        if not pw:
+            pw = os.environ.get(irc_env_name(name)) or None
+        if not pw and ask:
+            who = cfg["account"] or cfg["nick"]
+            pw = self.prompt("password for %s on %s (not saved)" % (who, name), "", secret=True) or None
+        if pw:
+            self.irc_pw[name] = pw
+        return pw
+
+    def irc_connect(self, rec, ask=True):
+        cfg = self.irc_net_cfg(rec)
+        c = self.irc.get(cfg["name"])
+        if c is not None and c.thread is not None and c.thread.is_alive():
+            return c
+        pw = self.irc_password(cfg, rec, ask)
+        if cfg["auth"] != "none" and not pw:
+            if ask:
+                self.say("no password, not connecting", "err")
+            return None
+        if c is None:
+            c = self.irc[cfg["name"]] = IrcClient(cfg, password=pw)
+        else:
+            c.cfg, c.password = cfg, pw
+        c.start()
+        return c
+
+    def irc_autostart(self):
+        started = []
+        for rec in self.irc_nets():
+            if rec.get("autoconnect"):
+                c = self.irc_connect(rec, ask=False)
+                if c is not None:
+                    started.append(c)
+                else:
+                    self.say("irc: %s needs a password, open irc to connect" % (rec.get("name") or rec["host"]), "today", 5)
+
+    def irc_shutdown(self):
+        for c in list(self.irc.values()):
+            with contextlib.suppress(Exception):
+                c.stop("synth")
+
+    def irc_poll(self):
+        for c in list(self.irc.values()):
+            while c.alerts:
+                try:
+                    net, bname, nick, text = c.alerts.popleft()
+                except IndexError:
+                    break
+                if bname[:1] in c.chantypes:
+                    self.say("irc %s <%s> %s" % (bname, nick, clip(irc_strip_format(text), 70)), "today", 6)
+                else:
+                    self.say("irc message from %s: %s" % (nick, clip(irc_strip_format(text), 60)), "today", 6)
+                if self.opts.get("irc_bell", True):
+                    with contextlib.suppress(curses.error):
+                        curses.beep()
+
+    def irc_setup(self, libera=False):
+        host = "irc.libera.chat" if libera else self.prompt("IRC server host", "")
+        if not host or not host.strip():
+            return None
+        host = host.strip()
+        nick = self.prompt("nick", os.environ.get("USER", ""))
+        if not nick or not nick.strip():
+            return None
+        account = self.prompt("NickServ account (blank to connect without logging in)", nick.strip())
+        if account is None:
+            return None
+        chans = self.prompt("channels to join, comma separated (blank for none)", "")
+        if chans is None:
+            return None
+        rec = {"name": "libera" if libera else host, "host": host, "nick": nick.strip()}
+        if account.strip():
+            rec["account"], rec["auth"] = account.strip(), "sasl"
+        cl = [c.strip() for c in chans.split(",") if c.strip()]
+        if cl:
+            rec["channels"] = cl
+        nets = [n for n in (self.opts.get("irc_networks") or []) if isinstance(n, dict)] + [rec]
+        self.persist("irc_networks", nets)
+        self.apply_config()
+        self.say("added %s, the password is asked when you connect" % rec["name"])
+        return rec
+
+    def sv_action_irc_open(self):
+        self.act_irc()
+
+    def sv_action_irc_add_libera(self):
+        self.irc_setup(True)
+
+    def irc_dock_rows(self, W):
+        o = self.opts
+        if not o.get("irc_dock") or not self.irc:
+            return []
+        c = self.irc.get(self.irc_sel[0]) or next(iter(self.irc.values()))
+        key = self.irc_sel[1] if self.irc_sel[0] == c.name and self.irc_sel[1] in c.buffers else IRC_SERVER
+        snap = c.snapshot(key)
+        if not snap:
+            return []
+        n = max(1, int(o.get("irc_dock_lines", 4)))
+        un, men = c.totals()
+        head = " irc %s %s%s " % (c.name, snap["name"] if key != IRC_SERVER else "server",
+                                  ("  %d new" % un) if un else "")
+        rows = [(self.sym["hline"] * 2 + head + self.sym["hline"] * max(0, W - len(head) - 2), "today" if men else "border", False)]
+        fmt = o.get("irc_time") or "%H:%M"
+        shown = [l for l in snap["lines"] if l[1] in ("msg", "own", "action", "notice") or (l[1] in ("join", "part") and False)]
+        for ts, kind, nick, text in shown[-n:]:
+            stamp = dt.datetime.fromtimestamp(ts).strftime(fmt)
+            body = ("* %s %s" % (nick, text)) if kind == "action" else ("%s %s" % (nick, text))
+            rows.append((" %s %s" % (stamp, irc_strip_format(body)), "fg", False))
+        while len(rows) < n + 1:
+            rows.append(("", "dim", False))
+        return rows
+
+    def act_irc(self, arg=None):
+        if not self.irc_nets() and not self.irc:
+            i = self.menu("irc: add a network", ["Libera.Chat", "Another server...", "Cancel"], 0)
+            if i is None or i == 2:
+                return
+            if self.irc_setup(i == 0) is None:
+                return
+        nets = self.irc_nets()
+        for rec in nets:
+            if rec.get("autoconnect"):
+                self.irc_connect(rec)
+        want = (arg or "").strip().lower()
+        if want:
+            pick = [r for r in nets if str(r.get("name") or r["host"]).lower() == want]
+            if pick:
+                self.irc_connect(pick[0])
+        elif not any(c.thread and c.thread.is_alive() for c in self.irc.values()) and nets:
+            if len(nets) == 1:
+                self.irc_connect(nets[0])
+            else:
+                names = [str(r.get("name") or r["host"]) for r in nets] + ["(just look)"]
+                i = self.menu("irc: connect to", names, 0)
+                if i is not None and i < len(nets):
+                    self.irc_connect(nets[i])
+        self.irc_screen()
+
+    def irc_entries(self):
+        out = []
+        for c in self.irc.values():
+            out.append(("net", c, None))
+            with c.lock:
+                keys = list(c.buffers.keys())
+            for k in keys:
+                out.append(("buf", c, k))
+        return out
+
+    def irc_select(self, step=None, index=None):
+        bufs = [(c, k) for kind, c, k in self.irc_entries() if kind == "buf"]
+        if not bufs:
+            return
+        cur = (self.irc.get(self.irc_sel[0]), self.irc_sel[1])
+        try:
+            i = bufs.index(cur)
+        except ValueError:
+            i = 0
+        if step is not None:
+            i = (i + step) % len(bufs)
+        elif index is not None and 0 <= index < len(bufs):
+            i = index
+        c, k = bufs[i]
+        self.irc_sel = (c.name, k)
+
+    def irc_sync_view(self):
+        sel = self.irc_sel
+        for c in self.irc.values():
+            if c.name == sel[0] and sel[1] in c.buffers:
+                if c.viewing != sel[1] or c.buffers[sel[1]].unread:
+                    c.view(sel[1])
+            elif c.viewing is not None:
+                c.view(None)
+
+    def irc_add_task(self, text, notes=""):
+        p = parse_quick(text)
+        if not p["title"]:
+            self.say("title is empty", "err")
+            return None
+        with self.edit():
+            t = self.store.add(p["title"])
+            self.add_defaults(t)
+            self.apply_parsed(t, p, True)
+            if notes:
+                t["notes"] = notes
+        self.hook("on_add", t)
+        return t
+
+    def irc_share_text(self, t):
+        bits = ["[task #%d] %s" % (t["id"], t["title"])]
+        extra = []
+        if t.get("due"):
+            extra.append("due " + str(t["due"]))
+        if t.get("prio"):
+            extra.append("!%d" % t["prio"])
+        if t.get("project"):
+            extra.append("@" + t["project"])
+        extra += ["#" + x for x in t.get("tags") or []]
+        if extra:
+            bits.append("(" + ", ".join(extra) + ")")
+        return " ".join(bits)
+
+    def irc_submit(self, text, hist_state):
+        """Handle one input line. Returns True when the screen should close."""
+        sel_c = self.irc.get(self.irc_sel[0])
+        key = self.irc_sel[1]
+        if text.startswith("/") and not text.startswith("//"):
+            cmd, _, rest = text[1:].partition(" ")
+            low, rest = cmd.lower(), rest.strip()
+            if low in ("exit", "leave-screen"):
+                return True
+            if low == "help":
+                if sel_c:
+                    for ln in self.IRC_HELP:
+                        sel_c.info(ln, key)
+                return False
+            if low == "connect":
+                pool = self.irc_nets()
+                name = rest.lower() or (sel_c.name.lower() if sel_c else "")
+                pick = [r for r in pool if str(r.get("name") or r["host"]).lower() == name]
+                if not pick and len(pool) == 1 and not rest:
+                    pick = pool
+                if not pick:
+                    self.say("no such network, add one in settings", "err")
+                else:
+                    self.irc_connect(pick[0])
+                    self.irc_pw_cleanup()
+                return False
+            if low in ("next", "prev"):
+                self.irc_select(step=1 if low == "next" else -1)
+                return False
+            if low == "task":
+                t = self.irc_add_task(rest) if rest else None
+                self.say("task added" if t else "usage: /task text", "ok" if t else "err")
+                return False
+            if sel_c is None:
+                self.say("not connected, use /connect", "err")
+                return False
+            if low in ("disconnect", "quit"):
+                sel_c.stop(rest or "synth")
+                sel_c.info("disconnected")
+                return low == "quit"
+            if low == "clear":
+                with sel_c.lock:
+                    sel_c.buffers[key].lines.clear()
+                    sel_c.rev += 1
+                return False
+            if low == "close":
+                if key == IRC_SERVER:
+                    self.say("the server buffer cannot be closed", "err")
+                    return False
+                b = sel_c.buffers.get(key)
+                if b and b.kind == "channel" and b.joined:
+                    sel_c.command(key, "/part")
+                self.irc_select(step=-1)
+                with sel_c.lock:
+                    sel_c.buffers.pop(key, None)
+                    sel_c.rev += 1
+                return False
+            if low == "share":
+                t = self.current()
+                if not t:
+                    self.say("no task selected", "err")
+                    return False
+                err = sel_c.privmsg(key, self.irc_share_text(t))
+                if err:
+                    self.say(err, "err")
+                return False
+            if low == "todo":
+                snap = sel_c.snapshot(key)
+                pick = None
+                for ts, kind, nick, body in reversed(snap["lines"] if snap else []):
+                    if kind in ("msg", "action") and nick.lower() != sel_c.nick.lower() and (not rest or nick.lower() == rest.lower()):
+                        pick = (ts, nick, body)
+                        break
+                if not pick:
+                    self.say("no message to turn into a task", "err")
+                    return False
+                ts, nick, body = pick
+                src = "from %s in %s on %s at %s" % (nick, snap["name"] if key != IRC_SERVER else "server", sel_c.name,
+                                                      dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M"))
+                title = " ".join(irc_strip_format(body).split())
+                t = self.store_task_plain(clip(title, 120), "%s\n\n%s" % (src, title) if len(title) > 120 else src)
+                self.say("task added from %s" % nick, "ok")
+                return False
+            err, switch = sel_c.command(key, text)
+            if err:
+                self.say(err, "err")
+            if switch:
+                self.irc_sel = (sel_c.name, switch)
+            return False
+        if text.startswith("//"):
+            text = text[1:]
+        if sel_c is None:
+            self.say("not connected, use /connect", "err")
+            return False
+        err = sel_c.privmsg(key, text)
+        if err:
+            self.say(err, "err")
+        return False
+
+    def irc_pw_cleanup(self):
+        pass
+
+    def store_task_plain(self, title, notes):
+        """Add a task with exactly this title, without quick add parsing."""
+        with self.edit():
+            t = self.store.add(title)
+            self.add_defaults(t)
+            t["notes"] = notes
+        self.hook("on_add", t)
+        return t
+
+    def irc_line_rows(self, entry, width, c):
+        """Turn one buffer line into rows of (text, role, bold) segments."""
+        ts, kind, nick, text = entry
+        o = self.opts
+        if kind in ("join", "part") and not o.get("irc_show_joins", True):
+            return []
+        stamp = dt.datetime.fromtimestamp(ts).strftime(o.get("irc_time") or "%H:%M") + " "
+        text = irc_strip_format(text)
+        colors = o.get("irc_nick_colors", True)
+        nrole = self.IRC_NICK_ROLES[irc_color_index(nick, len(self.IRC_NICK_ROLES))] if colors and nick else "fg"
+        mine = nick.lower() == c.nick.lower()
+        if kind in ("msg", "own"):
+            head = [(stamp, "dim", False), (nick, "accent" if (kind == "own" or mine) else nrole, True), ("  ", "fg", False)]
+            role = "today" if (kind == "msg" and not mine and irc_mentioned(text, c.nick)) else "fg"
+        elif kind == "action":
+            head = [(stamp, "dim", False), ("* ", "accent2", False), (nick, nrole, True), (" ", "fg", False)]
+            role = "accent2"
+        elif kind == "notice":
+            head = [(stamp, "dim", False), ("-%s- " % nick, "accent2", False)]
+            role = "accent2"
+        elif kind == "error":
+            head, role = [(stamp, "dim", False), ("!! ", "err", True)], "err"
+        else:
+            mark = {"join": "--> ", "part": "<-- "}.get(kind, "-- ")
+            head, role = [(stamp, "dim", False), (mark, "dim", False)], "dim"
+        hw = sum(cell_len(t) for t, _, _ in head)
+        avail = max(8, width - hw)
+        chunks = wrap(text, avail) or [""]
+        rows = [head + [(chunks[0], role, role == "today")]]
+        for ch in chunks[1:]:
+            rows.append([(" " * min(hw, 12), "fg", False), (ch, role, role == "today")])
+        return rows
+
+    def irc_screen(self):
+        st = {"scroll": 0, "dirty": True, "sig": None, "cand": None}
+        buf = list(self.irc_draft)
+        pos = len(buf)
+        hist = self.irc_hist
+        hi = [len(hist)]
+        if self.irc_sel[0] not in self.irc:
+            self.irc_sel = ("", IRC_SERVER)
+        if self.irc_sel[0] not in self.irc and self.irc:
+            first = next(iter(self.irc.values()))
+            self.irc_sel = (first.name, IRC_SERVER)
+
+        def geometry(H, W):
+            lw = min(26, max(16, W // 5)) if W >= 72 else 0
+            sel_c = self.irc.get(self.irc_sel[0])
+            key = self.irc_sel[1]
+            is_chan = bool(sel_c and key in sel_c.buffers and sel_c.buffers[key].kind == "channel")
+            nw = min(20, max(14, W // 6)) if (W >= 100 and is_chan) else 0
+            cx = lw + (1 if lw else 0)
+            cw = W - cx - (nw + 1 if nw else 0)
+            return lw, nw, cx, cw
+
+        def render():
+            scr = self.scr
+            scr.erase()
+            H, W = scr.getmaxyx()
+            if H < 8 or W < 30:
+                self.put(0, 0, "terminal too small", self.attr("err"))
+                return
+            self.irc_sync_view()
+            lw, nw, cx, cw = geometry(H, W)
+            sel_c = self.irc.get(self.irc_sel[0])
+            key = self.irc_sel[1]
+            snap = sel_c.snapshot(key) if sel_c else None
+            right = ""
+            if sel_c:
+                right = "%s as %s  %s" % (sel_c.name, sel_c.nick, sel_c.status)
+            self.screen_bar(W, "irc", right)
+            s = self.sym
+            top, bot = 2, H - 2
+            mh = bot - top
+            # buffer list
+            if lw:
+                r = 1
+                for kind, c, k in self.irc_entries():
+                    if r >= H - 2:
+                        break
+                    if kind == "net":
+                        glyph = {"online": "o" if self.opts["ascii"] else "●", "offline": "-" if self.opts["ascii"] else "○"}.get(c.status, "~" if self.opts["ascii"] else "◌")
+                        self.put(r, 1, clip("%s %s" % (glyph, c.name), lw - 1), self.attr("accent2" if c.status == "online" else "dim", bold=True))
+                    else:
+                        b = c.buffers[k]
+                        sel = (c.name, k) == self.irc_sel
+                        label = "server" if k == IRC_SERVER else b.name
+                        tail = ""
+                        if b.mentions:
+                            tail = " %d!" % b.mentions
+                        elif b.unread:
+                            tail = " %d" % b.unread
+                        a = self.attr("accent", "sel_bg", bold=True) if sel else self.attr("today" if b.mentions else ("fg" if b.unread else "dim"), bold=bool(b.unread))
+                        if sel:
+                            self.fill(r, 0, lw, a)
+                        self.put(r, 2, clip(label, lw - 3 - len(tail)), a)
+                        if tail:
+                            self.put(r, lw - len(tail) - 1, tail, a)
+                    r += 1
+                for rr in range(1, H - 2):
+                    self.put(rr, lw, s["vline"], self.attr("border"))
+            # topic row
+            title = ""
+            if snap:
+                title = ("server" if key == IRC_SERVER else snap["name"])
+                if snap["topic"]:
+                    title += "  " + irc_strip_format(snap["topic"])
+            else:
+                title = "no connection, type /connect or /help"
+            self.put(1, cx, clip(title, cw), self.attr("accent2", bold=True))
+            # messages
+            rows = []
+            if snap:
+                for entry in snap["lines"][-(mh + st["scroll"] + 60):]:
+                    rows.extend(self.irc_line_rows(entry, cw, sel_c))
+            maxscroll = max(0, len(rows) - mh)
+            st["scroll"] = max(0, min(st["scroll"], maxscroll))
+            end = len(rows) - st["scroll"]
+            window = rows[max(0, end - mh):end]
+            y0 = top + mh - len(window)
+            for i, row in enumerate(window):
+                x = cx
+                for text, role, bold in row:
+                    if x >= cx + cw:
+                        break
+                    x = self.put(top + (mh - len(window)) + i, x, text, self.attr(role, bold=bold), cx + cw - x)
+            if st["scroll"]:
+                self.put(top, cx + cw - 12, " scrolled %d " % st["scroll"], self.attr("today", "bar_bg"))
+            # nick list
+            if nw and snap:
+                nx = W - nw
+                for rr in range(1, H - 2):
+                    self.put(rr, nx - 1, s["vline"], self.attr("border"))
+                self.put(1, nx, "%d nicks" % len(snap["nicks"]), self.attr("dim"), nw)
+                for i, (n, pre) in enumerate(snap["nicks"][:H - 5]):
+                    role = "accent" if n.lower() == sel_c.nick.lower() else (self.IRC_NICK_ROLES[irc_color_index(n, len(self.IRC_NICK_ROLES))] if self.opts.get("irc_nick_colors", True) else "fg")
+                    self.put(2 + i, nx, clip((pre or " ") + n, nw - 1), self.attr(role))
+            # input
+            label = "[%s] " % ("server" if key == IRC_SERVER else (snap["name"] if snap else "-"))
+            label = clip(label, max(6, W // 3))
+            avail = W - 2 - cell_len(label)
+            start = 0
+            while cell_len("".join(buf[start:pos])) >= avail - 1:
+                start += 1
+            shown = "".join(buf[start:])
+            self.fill(H - 2, 0, W, self.attr("fg", "sel_bg"))
+            lx = self.put(H - 2, 1, label, self.attr("accent", "sel_bg", bold=True))
+            self.put(H - 2, lx, shown, self.attr("fg", "sel_bg"), avail)
+            cxp = lx + cell_len("".join(buf[start:pos]))
+            under = buf[pos] if pos < len(buf) else " "
+            self.put(H - 2, cxp, under, self.attr("fg", "sel_bg", reverse=True))
+            self.screen_foot(H, W, "enter send  tab nick  ctrl-n/p buffer  pgup/pgdn scroll  /help  esc back to tasks")
+            if self.msg and time.time() < self.msg_until:
+                self.fill(H - 1, 0, W, self.attr("fg", "bar_bg"))
+                self.put(H - 1, 1, self.msg, self.attr(self.msg_kind, "bar_bg", bold=True), W - 2)
+
+        def revsig():
+            return tuple(c.rev for c in self.irc.values()) + (self.irc_sel, self.msg)
+
+        self.backdrop = render
+        self.tick_override = 200
+        try:
+            while True:
+                sig = revsig()
+                if st["dirty"] or sig != st["sig"]:
+                    render()
+                    self.present()
+                    st["sig"], st["dirty"] = sig, False
+                name, ch = self.read_key()
+                if name == "tick":
+                    continue
+                st["dirty"] = True
+                if name in ("resize", "mouse"):
+                    continue
+                H, W = self.scr.getmaxyx()
+                mh = max(1, H - 4)
+                if name not in ("tab",):
+                    st["cand"] = None
+                if name in ("esc", "ctrl-c"):
+                    break
+                elif name == "enter":
+                    text = "".join(buf)
+                    buf, pos = [], 0
+                    st["scroll"] = 0
+                    if text.strip():
+                        if not text.startswith(("/ns", "/nickserv", "/identify", "/cs", "/chanserv", "/raw", "/quote")):
+                            hist[:] = [h for h in hist if h != text][-50:] + [text]
+                        hi[0] = len(hist)
+                        if self.irc_submit(text, hi):
+                            break
+                elif name in ("ctrl-n", "alt-down"):
+                    self.irc_select(step=1)
+                    st["scroll"] = 0
+                elif name in ("ctrl-p", "alt-up"):
+                    self.irc_select(step=-1)
+                    st["scroll"] = 0
+                elif name.startswith("alt-") and name[4:].isdigit():
+                    self.irc_select(index=int(name[4:]) - 1)
+                    st["scroll"] = 0
+                elif name == "pgup":
+                    st["scroll"] += max(1, mh - 2)
+                elif name == "pgdn":
+                    st["scroll"] = max(0, st["scroll"] - max(1, mh - 2))
+                elif name == "up":
+                    if hi[0] > 0:
+                        hi[0] -= 1
+                        buf = list(hist[hi[0]])
+                        pos = len(buf)
+                elif name == "down":
+                    if hi[0] < len(hist):
+                        hi[0] += 1
+                        buf = list(hist[hi[0]]) if hi[0] < len(hist) else []
+                        pos = len(buf)
+                elif name == "left":
+                    pos = max(0, pos - 1)
+                elif name == "right":
+                    pos = min(len(buf), pos + 1)
+                elif name in ("home", "ctrl-a"):
+                    pos = 0
+                elif name in ("end", "ctrl-e"):
+                    pos = len(buf)
+                elif name == "backspace":
+                    if pos > 0:
+                        del buf[pos - 1]
+                        pos -= 1
+                elif name == "delete":
+                    if pos < len(buf):
+                        del buf[pos]
+                elif name == "ctrl-u":
+                    del buf[:pos]
+                    pos = 0
+                elif name == "ctrl-k":
+                    del buf[pos:]
+                elif name == "ctrl-w":
+                    j = pos
+                    while j > 0 and buf[j - 1] == " ":
+                        j -= 1
+                    while j > 0 and buf[j - 1] != " ":
+                        j -= 1
+                    del buf[j:pos]
+                    pos = j
+                elif name == "tab":
+                    sel_c = self.irc.get(self.irc_sel[0])
+                    if sel_c:
+                        if st["cand"] is None:
+                            j = pos
+                            while j > 0 and buf[j - 1] != " ":
+                                j -= 1
+                            word = "".join(buf[j:pos])
+                            names = [n for n, _ in sel_c.nick_list(self.irc_sel[1])]
+                            hits = sorted([n for n in names if n.lower().startswith(word.lower().rstrip(":"))], key=str.lower) if word else []
+                            if hits:
+                                st["cand"] = {"start": j, "end": pos, "hits": hits, "i": -1}
+                        cd = st["cand"]
+                        if cd:
+                            cd["i"] = (cd["i"] + 1) % len(cd["hits"])
+                            rep = cd["hits"][cd["i"]] + (": " if cd["start"] == 0 else " ")
+                            buf[cd["start"]:cd["end"]] = list(rep)
+                            cd["end"] = cd["start"] + len(rep)
+                            pos = cd["end"]
+                elif ch:
+                    buf.insert(pos, ch)
+                    pos += 1
+        finally:
+            self.irc_draft = "".join(buf)
+            for c in self.irc.values():
+                if c.viewing is not None:
+                    c.view(None)
             self.backdrop = self.draw
             self.tick_override = None
 
@@ -10210,6 +11579,7 @@ class App:
             "back": self.act_back,
             "track": self.act_track,
             "focus_mode": self.act_focus,
+            "irc": self.act_irc,
             "stats": self.act_stats,
             "changes": self.act_changes,
             "git": self.act_git,
@@ -10290,6 +11660,7 @@ class App:
         self.wake_check()
         if self.opts.get("git_sync"):
             self.startup_sync()
+        self.irc_autostart()
         if self.opts.get("review_nudge", True) and self.store.tasks:
             last = self.state.get("last_review") or ""
             if not last or (today() - dt.date.fromisoformat(last)).days >= 7:
@@ -10390,6 +11761,7 @@ def main(argv=None):
         try:
             app.run()
         finally:
+            app.irc_shutdown()
             app.sync.finish()
 
     try:

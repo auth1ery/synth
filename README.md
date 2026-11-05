@@ -101,7 +101,7 @@ Custom views in the sidebar use the same syntax.
 | `R` | weekly review | `ctrl-g` | git menu (TODOs, branches, commits, GitHub, data sync) |
 | `.` | what now? | `m` | dependency graph (map) |
 | `M` | bulk edit the selection | `Q` | brain dump |
-| `ctrl-t` | time travel through data history | | |
+| `ctrl-t` | time travel through data history | `ctrl-k` | IRC chat (`:irc`) |
 
 Bulk actions (done, delete, priority, due, tags, project, repeat) apply to all selected tasks.
 Mouse: click selects, click the checkbox toggles, double click edits, wheel scrolls, click a view in the sidebar.
@@ -227,7 +227,7 @@ With `--profile NAME` the file is `settings-NAME.json`.
 ### Top bar widgets
 The top bar is built from widgets you order yourself (settings panel, Header category): `header_left` and `header_right`.
 Widgets: `app`, `view`, `sort`, `query`, `selection`, `timer`, `progress`, `momentum`, `habits`, `clock`, `date`, `open`,
-`overdue`, `due_today`, `greeting`, `week` and `text` (your own text from `header_text`). Widgets that have nothing to show
+`overdue`, `due_today`, `greeting`, `week`, `sync`, `event`, `irc` and `text` (your own text from `header_text`). Widgets that have nothing to show
 hide themselves, and ones that do not fit are skipped. `header_style` is `plain`, `divided` or `pills`.
 For the clock, `clock_12h` gives `3:07 PM` and `clock_seconds` adds seconds. `clock_format` (strftime) overrides both.
 
@@ -311,6 +311,50 @@ Set `ics_sources` to the paths or URLs of `.ics` files (Google, Outlook and Appl
 works). Recurring events, all day events and time zones are understood. Events show in the calendar (`~` marks days) and the
 agenda, the `event` header widget shows what is next, and `i` in the calendar turns an event into a task with its duration as the
 estimate. Web calendars are cached in the data folder and refreshed every `ics_refresh` minutes.
+
+## IRC chat (`ctrl-k`, `:irc`)
+Talk to people (or ask for help) without leaving your list. Add a network in the settings panel (IRC category), or press `ctrl-k`
+the first time and answer a few questions; "Add Libera.Chat" in settings does the same.
+
+**Logging in.** Set the network's login method to `sasl` (default when you give an account) or `nickserv`, and the NickServ
+account name. SASL PLAIN is used when the server offers it, with a NickServ `IDENTIFY` as the fallback. The password is **never
+written to disk**: not in `settings.json`, `config.toml`, the state file or the git tracked data folder. synth finds it in this order:
+
+1. the network's `password_cmd`, a shell command that prints it, for example `pass show irc/libera` (use a GUI pinentry, since
+   the command cannot ask on the terminal synth is using)
+2. the environment variable `SYNTH_IRC_PASSWORD_<NAME>`, with the network name uppercased, for example `SYNTH_IRC_PASSWORD_LIBERA`
+3. a masked prompt when you connect (kept in memory until you quit)
+
+Connections use TLS with certificate checking by default (port 6697). Passwords are refused on a network set to "No TLS", so they
+can never cross the network in the clear. Networks with `autoconnect` start with synth, but only when a password can be found
+without asking.
+
+**The screen.** Buffers on the left (unread count, `!` for mentions), the conversation in the middle with the topic above it, the
+nick list on the right when the terminal is wide, and an input line at the bottom. `esc` goes back to your tasks and the
+connection stays up. Mentions and private messages show in the status line (and ring the bell if `irc_bell` is on), and the `irc`
+top bar widget shows the unread or mention count.
+
+| key | action |
+| --- | --- |
+| `enter` | send the line, `/commands` as below |
+| `tab` | complete a nick, press again for the next match |
+| `ctrl-n` / `ctrl-p`, `alt-1` to `alt-9` | next or previous buffer, jump to a buffer |
+| `pgup` / `pgdn` | scroll back |
+| `up` / `down` | input history |
+| `esc` | back to the task list |
+
+Commands: `/join #chan`, `/part`, `/msg nick text`, `/me`, `/nick`, `/topic`, `/names`, `/whois`, `/away`, `/ns`, `/cs`,
+`/identify`, `/raw`, `/connect [network]`, `/disconnect`, `/close`, `/next`, `/prev`, `/clear`, `/exit`, `/help`. Lines to NickServ
+and ChanServ are never echoed into a buffer or saved in input history. `//text` sends a line that starts with a slash.
+
+Task integration: `/share` sends the selected task (title, due, priority, project, tags, never notes) to the current buffer,
+`/todo [nick]` turns the last message (from that nick, if given) into a task with a note saying who said it and where, and
+`/task TEXT` adds a task with the usual quick add syntax.
+
+Chat is kept in memory only (the last 500 lines per buffer), nothing is logged to disk. Set `irc_dock = true` for a small live
+strip of the current buffer under the task list (`irc_dock_lines` tall). Options: `irc_show_joins`, `irc_nick_colors`, `irc_time`
+(strftime), `irc_bell`. Network fields: `name host port nick auth account password_cmd channels autoconnect insecure noverify
+noreconnect user realname`.
 
 ## Parking lot
 In focus mode press `p` to jot down whatever just came to mind. It lands in the inbox tagged `#parked`, with a note of what you

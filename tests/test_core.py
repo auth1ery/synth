@@ -687,5 +687,155 @@ class SettingsPanelTests(unittest.TestCase):
         self.assertEqual(diff["changed"][0][2][0][0], "prio")
 
 
+class IrcParseTests(unittest.TestCase):
+    def test_parse(self):
+        m = synth.irc_parse("@time=2026-01-02T03:04:05.000Z :nick!user@host PRIVMSG #chan :hello there")
+        self.assertEqual((m["nick"], m["user"], m["host"], m["cmd"]), ("nick", "user", "host", "PRIVMSG"))
+        self.assertEqual(m["params"], ["#chan", "hello there"])
+        self.assertIn("time", m["tags"])
+        m = synth.irc_parse("PING :irc.example.net")
+        self.assertEqual((m["cmd"], m["params"]), ("PING", ["irc.example.net"]))
+        m = synth.irc_parse(":irc.example.net 001 me :Welcome")
+        self.assertEqual((m["nick"], m["cmd"], m["params"]), ("irc.example.net", "001", ["me", "Welcome"]))
+
+    def test_sasl_payload(self):
+        chunks = synth.irc_sasl_plain("acct", "pw")
+        self.assertEqual(chunks, ["AGFjY3QAcHc="])
+        long = synth.irc_sasl_plain("a" * 200, "b" * 200)
+        self.assertTrue(all(len(c) <= 400 for c in long))
+        exact = synth.irc_sasl_plain("a" * 148, "b" * 149)  # 300 raw bytes, 400 base64 chars
+        self.assertEqual(exact[-1], "+")
+
+    def test_split_and_clean(self):
+        parts = synth.irc_split("word " * 200, 100)
+        self.assertTrue(all(len(x.encode()) <= 100 for x in parts))
+        self.assertEqual(" ".join(parts), ("word " * 200).strip())
+        parts = synth.irc_split("\u00e9" * 300, 100)
+        self.assertTrue(all(len(x.encode()) <= 100 for x in parts))
+        self.assertNotIn("\n", synth.irc_clean("a\r\nQUIT :x"))
+
+    def test_mentions_and_format(self):
+        self.assertTrue(synth.irc_mentioned("hey Bob, look", "bob"))
+        self.assertTrue(synth.irc_mentioned("bob: hi", "Bob"))
+        self.assertFalse(synth.irc_mentioned("bobby is here", "bob"))
+        self.assertEqual(synth.irc_strip_format("\x02bold\x0f \x0304,05red\x03"), "bold red")
+        self.assertEqual(synth.irc_env_name("Libera.Chat"), "SYNTH_IRC_PASSWORD_LIBERA_CHAT")
+
+
+class FakeIrcServer:
+    """A tiny server: SASL PLAIN, registration, JOIN, echoes what the client sends."""
+
+    def __init__(self):
+        import socket
+        import threading
+        self.srv = socket.socket()
+        self.srv.bind(("127.0.0.1", 0))
+        self.srv.listen(1)
+        self.port = self.srv.getsockname()[1]
+        self.got = []
+        self.conn = None
+        self.t = threading.Thread(target=self.run, daemon=True)
+        self.t.start()
+
+    def out(self, line):
+        self.conn.sendall((line + "\r\n").encode())
+
+    def run(self):
+        import base64
+        self.conn, _ = self.srv.accept()
+        self.conn.settimeout(5)
+        data = b""
+        try:
+            while True:
+                chunk = self.conn.recv(4096)
+                if not chunk:
+                    return
+                data += chunk
+                while b"\n" in data:
+                    raw, _, data = data.partition(b"\n")
+                    line = raw.decode().rstrip("\r")
+                    self.got.append(line)
+                    if line.startswith("CAP LS"):
+                        self.out(":srv CAP * LS :sasl=PLAIN server-time multi-prefix away-notify")
+                    elif line.startswith("CAP REQ"):
+                        self.out(":srv CAP * ACK :sasl server-time multi-prefix")
+                    elif line == "AUTHENTICATE PLAIN":
+                        self.out("AUTHENTICATE +")
+                    elif line.startswith("AUTHENTICATE ") and line != "AUTHENTICATE PLAIN":
+                        self.account = base64.b64decode(line.split()[1]).split(b"\0")
+                        self.out(":srv 903 me :SASL authentication successful")
+                    elif line == "CAP END":
+                        self.out(":srv 001 me :Welcome to FakeNet")
+                        self.out(":srv 005 me PREFIX=(ov)@+ CHANTYPES=# :are supported")
+                    elif line.startswith("PING"):
+                        self.out("PONG :" + line[5:])
+                    elif line.startswith("JOIN "):
+                        ch = line.split()[1]
+                        self.out(":me!u@h JOIN " + ch)
+                        self.out(":srv 353 me = %s :@op me alice" % ch)
+                        self.out(":srv 366 me %s :End" % ch)
+                        self.out("@time=2026-01-02T03:04:05.000Z :alice!a@h PRIVMSG %s :hello me, welcome" % ch)
+                    elif line.startswith("PRIVMSG "):
+                        self.out(":srv NOTICE me :got it")
+        except OSError:
+            pass
+
+
+class IrcClientTests(unittest.TestCase):
+    def wait(self, fn, secs=5):
+        import time
+        end = time.time() + secs
+        while time.time() < end:
+            if fn():
+                return True
+            time.sleep(0.02)
+        return False
+
+    def test_session(self):
+        srv = FakeIrcServer()
+        cfg = {"name": "fake", "host": "127.0.0.1", "port": srv.port, "tls": False, "plain_auth": True,
+               "nick": "me", "account": "myacct", "auth": "sasl", "channels": ["#synth"], "reconnect": False}
+        c = synth.IrcClient(cfg, password="secret")
+        c.start()
+        try:
+            self.assertTrue(self.wait(lambda: c.status == "online"))
+            self.assertEqual(srv.account, [b"", b"myacct", b"secret"])
+            self.assertTrue(self.wait(lambda: "#synth" in c.buffers and c.buffers["#synth"].lines))
+            b = c.buffers["#synth"]
+            self.assertTrue(self.wait(lambda: any(l[1] == "msg" for l in b.lines)))
+            self.assertEqual(c.nick_list("#synth")[0], ("op", "@"))
+            msg = [l for l in b.lines if l[1] == "msg"][0]
+            self.assertEqual((msg[2], msg[3]), ("alice", "hello me, welcome"))
+            self.assertEqual(b.mentions, 1)
+            self.assertEqual(c.alerts[0][2], "alice")
+            err, _ = c.command("#synth", "/msg alice hi there")
+            self.assertIsNone(err)
+            self.assertTrue(self.wait(lambda: "PRIVMSG alice :hi there" in srv.got))
+            self.assertIn("alice", c.buffers)
+            self.assertTrue(self.wait(lambda: any(l[1] == "notice" or l[1] == "info" for l in c.buffers["*"].lines if "got it" in l[3])))
+            c.privmsg("#synth", "a b\r\nQUIT :x")
+            self.assertTrue(self.wait(lambda: any(g.startswith("PRIVMSG #synth :a b") for g in srv.got)))
+            self.assertFalse(any(g.startswith("QUIT") for g in srv.got))
+            c.command("#synth", "/ns identify topsecret")
+            self.assertTrue(self.wait(lambda: "PRIVMSG NickServ :identify topsecret" in srv.got))
+            for buf in c.buffers.values():
+                self.assertFalse(any("topsecret" in l[3] or "secret" == l[3] for l in buf.lines))
+        finally:
+            c.stop()
+
+    def test_no_password_without_tls(self):
+        srv = FakeIrcServer()
+        cfg = {"name": "fake", "host": "127.0.0.1", "port": srv.port, "tls": False,
+               "nick": "me", "auth": "sasl", "reconnect": False}
+        c = synth.IrcClient(cfg, password="secret")
+        c.start()
+        try:
+            self.assertTrue(self.wait(lambda: c.status == "online"))
+            self.assertFalse(any("secret" in g or g.startswith("AUTHENTICATE") for g in srv.got))
+            self.assertFalse(any("IDENTIFY" in g for g in srv.got))
+        finally:
+            c.stop()
+
+
 if __name__ == "__main__":
     unittest.main()
