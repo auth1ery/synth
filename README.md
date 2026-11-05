@@ -351,8 +351,16 @@ Task integration: `/share` sends the selected task (title, due, priority, projec
 `/todo [nick]` turns the last message (from that nick, if given) into a task with a note saying who said it and where, and
 `/task TEXT` adds a task with the usual quick add syntax.
 
-Chat is kept in memory only (the last 500 lines per buffer), nothing is logged to disk. Set `irc_dock = true` for a small live
-strip of the current buffer under the task list (`irc_dock_lines` tall). Options: `irc_show_joins`, `irc_nick_colors`, `irc_time`
+**Split screen and mouse.** Chat does not have to take over the screen. Set the chat pane (settings, IRC category, or `:irc right`,
+`:irc bottom`, `:irc off`) and it docks beside your tasks, on the right when the terminal is at least 100 columns wide, otherwise
+along the bottom (`irc_dock_lines` tall, needs 18 rows). `ctrl-k` then focuses the pane so you can type while the task list stays
+on screen, `esc` hands the keys back, `ctrl-f` makes it fullscreen and back, and `ctrl-s` cycles right, bottom and off (in the
+fullscreen chat, `ctrl-s` docks it beside your tasks). The pane has a clickable tab per buffer, and the left sidebar gets a CHAT
+section listing your networks and channels with unread counts (`irc_sidebar`): click one to open it in the pane. With the mouse
+on you can also click a buffer, click a nick in the nick list to start a private chat, and use the wheel to scroll back (over
+the tabs it switches buffers). Terminals only let you select text while mouse support is on if you hold shift.
+
+Chat is kept in memory only (the last 500 lines per buffer), nothing is logged to disk. Options: `irc_show_joins`, `irc_nick_colors`, `irc_time`
 (strftime), `irc_bell`. Network fields: `name host port nick auth account password_cmd channels autoconnect insecure noverify
 noreconnect user realname`.
 

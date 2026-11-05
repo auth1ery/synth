@@ -295,6 +295,8 @@ DEFAULTS = {
     "templates": [],
     "irc_networks": [],
     "irc_dock": False,
+    "irc_layout": "off",
+    "irc_sidebar": True,
     "irc_dock_lines": 4,
     "irc_show_joins": True,
     "irc_nick_colors": True,
@@ -321,6 +323,7 @@ STR_OPTS = {
     "detail_tab": ["notes", "info", "links", "history"],
     "note_stamp": None,
     "irc_time": None,
+    "irc_layout": ["off", "right", "bottom"],
     "clock_format": None,
     "header_style": ["plain", "divided", "pills"],
     "header_text": None,
@@ -328,7 +331,7 @@ STR_OPTS = {
 }
 
 SORTS = ["manual", "priority", "due", "created", "alpha"]  # custom sorts are added from [sorts]
-BOOL_OPTS = ["sync_output", "git_sync", "git_push", "git_auto_done", "review_nudge", "clock_12h", "clock_seconds", "header_momentum", "history", "snooze_hide", "notes_inline", "header_habits", "header_clock", "header_progress", "header_info", "irc_dock", "irc_show_joins", "irc_nick_colors", "irc_bell",
+BOOL_OPTS = ["sync_output", "git_sync", "git_push", "git_auto_done", "review_nudge", "clock_12h", "clock_seconds", "header_momentum", "history", "snooze_hide", "notes_inline", "header_habits", "header_clock", "header_progress", "header_info", "irc_dock", "irc_sidebar", "irc_show_joins", "irc_nick_colors", "irc_bell",
              "sidebar_counts", "mouse",
              "sidebar", "ascii", "transparent", "exact_colors", "animations", "show_done", "cascade_done",
              "confirm_delete", "focus_auto", "focus_bell"]
@@ -4002,8 +4005,9 @@ def build_settings_tree():
         _s("irc_networks", "Networks", "records",
            "IRC servers. Login is SASL or NickServ with your account. The password is never saved: give a Password command (for example pass show irc/libera), set the SYNTH_IRC_PASSWORD_<NAME> environment variable, or synth asks when you connect.",
            fields="irc"),
-        _s("irc_dock", "Chat Strip on Main Screen", "bool", "Show the latest chat lines under the task list."),
-        _s("irc_dock_lines", "Chat Strip Lines", "int", "Height of the chat strip.", min=1, max=12),
+        _s("irc_layout", "Chat Pane", "choice", "Split the main screen: chat on the right, on the bottom, or off. ctrl-s inside chat cycles it.", choices=["off", "right", "bottom"]),
+        _s("irc_dock_lines", "Bottom Pane Lines", "int", "How many message lines the bottom chat pane shows.", min=1, max=12),
+        _s("irc_sidebar", "Chat in Sidebar", "bool", "List chat buffers in the left sidebar (click one to open it)."),
         _s("irc_show_joins", "Show Joins and Parts", "bool", "Show who joins, leaves and quits."),
         _s("irc_nick_colors", "Colored Nicks", "bool", "Give each nick its own color."),
         _s("irc_time", "Time Format", "text", "strftime format of message times, for example %H:%M or %I:%M %p."),
@@ -4166,8 +4170,13 @@ class App:
         self.irc = {}
         self.irc_pw = {}
         self.irc_sel = ("", IRC_SERVER)
-        self.irc_draft = ""
         self.irc_hist = []
+        self.irc_in = {"buf": [], "pos": 0, "hi": 0, "cand": None}
+        self.irc_scroll = 0
+        self.irc_mh = 10
+        self.irc_hits = []
+        self.irc_side = []
+        self.irc_last_layout = ""
         self.bar_disp = 0.0
         self.bar_busy = False
         self.jump_stack = []
@@ -5581,14 +5590,29 @@ class App:
         sw = o["sidebar_width"] if o["sidebar"] and W >= 60 else 0
         list_x = sw + (1 if sw else 0)
         body_y, body_h = 1, H - 2
-        dock = self.irc_dock_rows(W) if H >= 18 else []
-        body_h -= len(dock)
+        pane, main_w = None, W
+        lay = self.irc_layout() if self.irc else "off"
+        if lay == "right" and W - list_x >= 100:
+            pw_ = min(max(36, W // 3), 64)
+            pane = (body_y, W - pw_, body_h, pw_, "right")
+            main_w = W - pw_ - 1
+        elif lay in ("right", "bottom") and H >= 18:
+            ph_ = max(1, min(int(o.get("irc_dock_lines", 4)), 12)) + 2
+            body_h -= ph_
+            pane = (H - 1 - ph_, 0, ph_, W, "bottom")
+        self.irc_hits = []
+        self.irc_side = []
+        if pane is None:
+            if self.irc:
+                self.irc_sync_view(False)
+            if self.focus == "chat":
+                self.focus = "list"
         dw = dh = 0
-        if o["detail"] == "right" and W - list_x >= 72:
-            dw = min(o["detail_size"], W - list_x - 36)
+        if o["detail"] == "right" and main_w - list_x >= 72:
+            dw = min(o["detail_size"], main_w - list_x - 36)
         elif o["detail"] == "bottom" and body_h >= 16:
             dh = min(o["detail_size"] if o["detail_size"] < 20 else 9, body_h - 8)
-        list_w = W - list_x - (dw + 1 if dw else 0)
+        list_w = main_w - list_x - (dw + 1 if dw else 0)
         list_h = body_h - (dh + 1 if dh else 0)
         self.geo = {"list_x": list_x, "list_y": body_y, "list_w": list_w, "list_h": list_h, "sw": sw}
 
@@ -5626,8 +5650,11 @@ class App:
             self.put(dy, list_x, s["hline"] * list_w, self.attr("border"))
             self.draw_detail(list_x + 1, dy + 1, list_w - 2, dh)
 
-        for i, (text, role, bold) in enumerate(dock):
-            self.put(H - 1 - len(dock) + i, 0, clip(text, W), self.attr(role, bold=bold), W)
+        if pane is not None:
+            if pane[4] == "right":
+                for r in range(body_h):
+                    self.put(body_y + r, main_w, s["vline"], self.attr("border"))
+            self.irc_draw_pane(*pane)
 
         # footer
         fb = self.attr("fg", "bar_bg")
@@ -5637,12 +5664,14 @@ class App:
             right = "%d selected " % len(self.selected)
         if self.pending:
             right = "%s ... " % self.pending + right
-        right += "[%s] %d/%d" % ("side" if self.focus == "sidebar" else "list", min(self.cur + 1, len(self.rows)), len(self.rows))
+        where = {"sidebar": "side", "chat": "chat"}.get(self.focus, "list")
+        right += "[%s] %d/%d" % (where, min(self.cur + 1, len(self.rows)), len(self.rows))
         left_w = max(0, W - cell_len(right) - 4)
         if self.msg and time.time() < self.msg_until:
             self.put(H - 1, 1, self.msg, self.attr(self.msg_kind, "bar_bg", bold=True), left_w)
         else:
-            self.put(H - 1, 1, self.hint_line(), self.attr("dim", "bar_bg"), left_w)
+            hint = "chat: enter send  tab nick  ctrl-n/p buffer  ctrl-f fullscreen  ctrl-s layout  esc tasks" if self.focus == "chat" else self.hint_line()
+            self.put(H - 1, 1, hint, self.attr("dim", "bar_bg"), left_w)
         self.put(H - 1, W - cell_len(right) - 2, right, self.attr("accent2", "bar_bg"))
         self.present()
 
@@ -5684,6 +5713,47 @@ class App:
             self.put(y + r, 2, label, self.attr("accent" if focus else ("accent2" if active else "fg"), bg, bold=active))
             cnt = str(item["count"]) if item["count"] else ""
             self.put(y + r, w - 1 - len(cnt), cnt, self.attr("dim", bg))
+        if self.irc and self.opts.get("irc_sidebar", True):
+            self.draw_sidebar_chat(y, h, w, min(len(items), h))
+
+    def draw_sidebar_chat(self, y, h, w, used):
+        r = used + 1
+        if r >= h - 1:
+            return
+        un = men = 0
+        for c in self.irc.values():
+            a, b = c.totals()
+            un, men = un + a, men + b
+        total = ("%d!" % men) if men else (str(un) if un else "")
+        self.put(y + r, 1, "CHAT", self.attr("dim", bold=True))
+        if total:
+            self.put(y + r, w - 1 - len(total), total, self.attr("today" if men else "dim", bold=bool(men)))
+        r += 1
+        pane_on = self.irc_layout() != "off"
+        for c in self.irc.values():
+            if r >= h:
+                return
+            glyph = {"online": "o" if self.opts["ascii"] else "●", "offline": "-" if self.opts["ascii"] else "○"}.get(c.status, "~" if self.opts["ascii"] else "◌")
+            self.put(y + r, 1, clip("%s %s" % (glyph, c.name), w - 2), self.attr("accent2" if c.status == "online" else "dim", bold=True))
+            self.irc_side.append((y + r, c.name, IRC_SERVER))
+            r += 1
+            with c.lock:
+                keys = [k for k in c.buffers if k != IRC_SERVER]
+            for k in keys:
+                if r >= h:
+                    return
+                b = c.buffers[k]
+                active = pane_on and (c.name, k) == self.irc_sel
+                bg = "sel_bg" if active else "bg"
+                if active:
+                    self.fill(y + r, 0, w, self.attr("fg", bg))
+                tail = (" %d!" % b.mentions) if b.mentions else ((" %d" % b.unread) if b.unread else "")
+                role = "today" if b.mentions else ("fg" if (b.unread or active) else "dim")
+                self.put(y + r, 2, clip(b.name, w - 3 - len(tail)), self.attr(role, bg, bold=bool(b.unread) or active))
+                if tail:
+                    self.put(y + r, w - len(tail) - 1, tail, self.attr(role, bg))
+                self.irc_side.append((y + r, c.name, k))
+                r += 1
 
     def draw_list(self, x, y, w, h):
         if not self.rows:
@@ -7895,43 +7965,62 @@ class App:
     def sv_action_irc_add_libera(self):
         self.irc_setup(True)
 
-    def irc_dock_rows(self, W):
+    def irc_layout(self):
         o = self.opts
-        if not o.get("irc_dock") or not self.irc:
-            return []
-        c = self.irc.get(self.irc_sel[0]) or next(iter(self.irc.values()))
-        key = self.irc_sel[1] if self.irc_sel[0] == c.name and self.irc_sel[1] in c.buffers else IRC_SERVER
-        snap = c.snapshot(key)
-        if not snap:
-            return []
-        n = max(1, int(o.get("irc_dock_lines", 4)))
-        un, men = c.totals()
-        head = " irc %s %s%s " % (c.name, snap["name"] if key != IRC_SERVER else "server",
-                                  ("  %d new" % un) if un else "")
-        rows = [(self.sym["hline"] * 2 + head + self.sym["hline"] * max(0, W - len(head) - 2), "today" if men else "border", False)]
-        fmt = o.get("irc_time") or "%H:%M"
-        shown = [l for l in snap["lines"] if l[1] in ("msg", "own", "action", "notice") or (l[1] in ("join", "part") and False)]
-        for ts, kind, nick, text in shown[-n:]:
-            stamp = dt.datetime.fromtimestamp(ts).strftime(fmt)
-            body = ("* %s %s" % (nick, text)) if kind == "action" else ("%s %s" % (nick, text))
-            rows.append((" %s %s" % (stamp, irc_strip_format(body)), "fg", False))
-        while len(rows) < n + 1:
-            rows.append(("", "dim", False))
-        return rows
+        lay = o.get("irc_layout") or ("bottom" if o.get("irc_dock") else "off")
+        return lay if lay in ("right", "bottom") else "off"
+
+    def irc_set_layout(self, mode, focus=True):
+        if mode not in ("off", "right", "bottom"):
+            return
+        self.persist("irc_layout", mode)
+        self.apply_config()
+        if mode != "off":
+            self.irc_last_layout = mode
+            if focus:
+                self.focus = "chat"
+        elif self.focus == "chat":
+            self.focus = "list"
+
+    def irc_show_pane(self):
+        """Make sure a chat pane is visible and give it the keyboard."""
+        if self.scr.getmaxyx()[0] < 18:
+            self.irc_screen()
+            return
+        if self.irc_layout() == "off":
+            H, W = self.scr.getmaxyx()
+            want = self.irc_last_layout or ("right" if W >= 100 else "bottom")
+            self.irc_set_layout(want)
+        self.focus = "chat"
 
     def act_irc(self, arg=None):
+        word = (arg or "").strip().lower()
+        if word in ("right", "bottom", "off"):
+            if word != "off" and not self.irc:
+                self.irc_start_flow()
+            if word == "off" or self.irc:
+                self.irc_set_layout(word)
+            return
+        if not self.irc_start_flow(word):
+            return
+        if self.irc_layout() != "off" and word != "full" and self.scr.getmaxyx()[0] >= 18:
+            self.focus = "chat"
+            return
+        self.irc_screen()
+
+    def irc_start_flow(self, want=""):
+        """Set up and connect networks as needed. False when there is nothing to chat with."""
         if not self.irc_nets() and not self.irc:
             i = self.menu("irc: add a network", ["Libera.Chat", "Another server...", "Cancel"], 0)
             if i is None or i == 2:
-                return
+                return False
             if self.irc_setup(i == 0) is None:
-                return
+                return False
         nets = self.irc_nets()
         for rec in nets:
             if rec.get("autoconnect"):
                 self.irc_connect(rec)
-        want = (arg or "").strip().lower()
-        if want:
+        if want and want != "full":
             pick = [r for r in nets if str(r.get("name") or r["host"]).lower() == want]
             if pick:
                 self.irc_connect(pick[0])
@@ -7943,7 +8032,7 @@ class App:
                 i = self.menu("irc: connect to", names, 0)
                 if i is not None and i < len(nets):
                     self.irc_connect(nets[i])
-        self.irc_screen()
+        return True
 
     def irc_entries(self):
         out = []
@@ -7955,7 +8044,7 @@ class App:
                 out.append(("buf", c, k))
         return out
 
-    def irc_select(self, step=None, index=None):
+    def irc_select(self, step=None, index=None, to=None):
         bufs = [(c, k) for kind, c, k in self.irc_entries() if kind == "buf"]
         if not bufs:
             return
@@ -7968,17 +8057,32 @@ class App:
             i = (i + step) % len(bufs)
         elif index is not None and 0 <= index < len(bufs):
             i = index
+        elif to is not None:
+            for j, (c, k) in enumerate(bufs):
+                if (c.name, k) == to:
+                    i = j
         c, k = bufs[i]
+        if (c.name, k) != self.irc_sel:
+            self.irc_scroll = 0
         self.irc_sel = (c.name, k)
 
-    def irc_sync_view(self):
+    def irc_sync_view(self, show=True):
         sel = self.irc_sel
         for c in self.irc.values():
-            if c.name == sel[0] and sel[1] in c.buffers:
+            if show and c.name == sel[0] and sel[1] in c.buffers:
                 if c.viewing != sel[1] or c.buffers[sel[1]].unread:
                     c.view(sel[1])
             elif c.viewing is not None:
                 c.view(None)
+
+    def irc_current(self):
+        """Make sure a buffer is selected and return (client, key)."""
+        if not self.irc:
+            return None, IRC_SERVER
+        if self.irc_sel[0] not in self.irc or self.irc_sel[1] not in self.irc[self.irc_sel[0]].buffers:
+            first = next(iter(self.irc.values()))
+            self.irc_sel = (first.name, IRC_SERVER)
+        return self.irc[self.irc_sel[0]], self.irc_sel[1]
 
     def irc_add_task(self, text, notes=""):
         p = parse_quick(text)
@@ -8152,27 +8256,289 @@ class App:
             rows.append([(" " * min(hw, 12), "fg", False), (ch, role, role == "today")])
         return rows
 
-    def irc_screen(self):
-        st = {"scroll": 0, "dirty": True, "sig": None, "cand": None}
-        buf = list(self.irc_draft)
-        pos = len(buf)
-        hist = self.irc_hist
-        hi = [len(hist)]
-        if self.irc_sel[0] not in self.irc:
-            self.irc_sel = ("", IRC_SERVER)
-        if self.irc_sel[0] not in self.irc and self.irc:
-            first = next(iter(self.irc.values()))
-            self.irc_sel = (first.name, IRC_SERVER)
+    def irc_tab_label(self, c, k, b):
+        if k == IRC_SERVER:
+            name = c.name if len(self.irc) > 1 else "server"
+        else:
+            name = b.name
+        tail = ""
+        if b.mentions:
+            tail = " %d!" % b.mentions
+        elif b.unread:
+            tail = " %d" % b.unread
+        return name + tail
 
-        def geometry(H, W):
-            lw = min(26, max(16, W // 5)) if W >= 72 else 0
-            sel_c = self.irc.get(self.irc_sel[0])
-            key = self.irc_sel[1]
-            is_chan = bool(sel_c and key in sel_c.buffers and sel_c.buffers[key].kind == "channel")
-            nw = min(20, max(14, W // 6)) if (W >= 100 and is_chan) else 0
-            cx = lw + (1 if lw else 0)
-            cw = W - cx - (nw + 1 if nw else 0)
-            return lw, nw, cx, cw
+    def irc_draw_pane(self, oy, ox, ph, pw, mode):
+        """Draw chat into a rectangle. mode is full (the chat screen), right or bottom (split with the tasks)."""
+        full = mode == "full"
+        focused = full or self.focus == "chat"
+        s = self.sym
+        hits = self.irc_hits
+        c, key = self.irc_current()
+        self.irc_sync_view(True)
+        snap = c.snapshot(key) if c else None
+        lw = min(26, max(16, pw // 5)) if (full and pw >= 72) else 0
+        nw = 0
+        if full and pw >= 100 and snap and snap["kind"] == "channel":
+            nw = min(20, max(14, pw // 6))
+        cx = ox + lw + (1 if lw else 0)
+        cw = pw - (cx - ox) - (nw + 1 if nw else 0)
+        input_y = oy + ph - 1
+        if lw:
+            topic_y, msg_top = oy, oy + 1
+            r = oy
+            for kind, cc, k in self.irc_entries():
+                if r >= input_y:
+                    break
+                if kind == "net":
+                    glyph = {"online": "o" if self.opts["ascii"] else "●", "offline": "-" if self.opts["ascii"] else "○"}.get(cc.status, "~" if self.opts["ascii"] else "◌")
+                    self.put(r, ox + 1, clip("%s %s" % (glyph, cc.name), lw - 1), self.attr("accent2" if cc.status == "online" else "dim", bold=True))
+                else:
+                    b = cc.buffers[k]
+                    sel = (cc.name, k) == self.irc_sel
+                    label = "server" if k == IRC_SERVER else b.name
+                    tail = (" %d!" % b.mentions) if b.mentions else ((" %d" % b.unread) if b.unread else "")
+                    a = self.attr("accent", "sel_bg", bold=True) if sel else self.attr("today" if b.mentions else ("fg" if b.unread else "dim"), bold=bool(b.unread))
+                    if sel:
+                        self.fill(r, ox, lw, a)
+                    self.put(r, ox + 2, clip(label, lw - 3 - len(tail)), a)
+                    if tail:
+                        self.put(r, ox + lw - len(tail) - 1, tail, a)
+                    hits.append(("buf", ox, r, ox + lw, r + 1, (cc.name, k)))
+                r += 1
+            for rr in range(oy, input_y):
+                self.put(rr, ox + lw, s["vline"], self.attr("border"))
+        else:
+            self.fill(oy, ox, pw, self.attr("fg", "bar_bg"))
+            tabs = [(cc, k, cc.buffers[k]) for kind, cc, k in self.irc_entries() if kind == "buf"]
+            labels = [" %s " % self.irc_tab_label(cc, k, b) for cc, k, b in tabs]
+            sel_i = next((i for i, (cc, k, _) in enumerate(tabs) if (cc.name, k) == self.irc_sel), 0)
+            start = 0
+            while start < sel_i and sum(cell_len(x) for x in labels[start:sel_i + 1]) > pw - 2:
+                start += 1
+            x = ox
+            for i in range(start, len(tabs)):
+                cc, k, b = tabs[i]
+                w_ = cell_len(labels[i])
+                if x + w_ > ox + pw:
+                    break
+                if i == sel_i:
+                    a = self.attr("accent", "sel_bg", bold=True)
+                elif b.mentions:
+                    a = self.attr("today", "bar_bg", bold=True)
+                elif b.unread:
+                    a = self.attr("fg", "bar_bg", bold=True)
+                else:
+                    a = self.attr("dim", "bar_bg")
+                self.put(oy, x, labels[i], a)
+                hits.append(("buf", x, oy, x + w_, oy + 1, (cc.name, k)))
+                x += w_
+            if ph >= 8:
+                topic_y, msg_top = oy + 1, oy + 2
+            else:
+                topic_y, msg_top = None, oy + 1
+        mh = max(1, input_y - msg_top)
+        self.irc_mh = mh
+        if topic_y is not None:
+            if snap:
+                title = ("%s %s" % (c.name, c.status)) if key == IRC_SERVER else snap["name"]
+                if snap["topic"]:
+                    title += "  " + irc_strip_format(snap["topic"])
+                self.put(topic_y, cx, clip(title, cw), self.attr("accent2", bold=True), cw)
+            else:
+                self.put(topic_y, cx, clip("no connection, type /connect or /help", cw), self.attr("dim"), cw)
+        rows = []
+        if snap:
+            for entry in snap["lines"][-(mh + self.irc_scroll + 60):]:
+                rows.extend(self.irc_line_rows(entry, cw, c))
+        self.irc_scroll = max(0, min(self.irc_scroll, max(0, len(rows) - mh)))
+        end = len(rows) - self.irc_scroll
+        window = rows[max(0, end - mh):end]
+        for i, row in enumerate(window):
+            x = cx
+            for text, role, bold in row:
+                if x >= cx + cw:
+                    break
+                x = self.put(msg_top + (mh - len(window)) + i, x, text, self.attr(role, bold=bold), cx + cw - x)
+        if self.irc_scroll:
+            self.put(msg_top, cx + cw - 12, " scrolled %d " % self.irc_scroll, self.attr("today", "bar_bg"))
+        hits.append(("msgs", cx, msg_top, cx + cw, msg_top + mh, None))
+        if nw and snap:
+            nx = ox + pw - nw
+            for rr in range(oy, input_y):
+                self.put(rr, nx - 1, s["vline"], self.attr("border"))
+            self.put(oy, nx, "%d nicks" % len(snap["nicks"]), self.attr("dim"), nw)
+            for i, (n, pre) in enumerate(snap["nicks"][:max(0, input_y - oy - 1)]):
+                mine = c.nick.lower() == n.lower()
+                role = "accent" if mine else (self.IRC_NICK_ROLES[irc_color_index(n, len(self.IRC_NICK_ROLES))] if self.opts.get("irc_nick_colors", True) else "fg")
+                self.put(oy + 1 + i, nx, clip((pre or " ") + n, nw - 1), self.attr(role), nw - 1)
+                hits.append(("nick", nx, oy + 1 + i, nx + nw, oy + 2 + i, n))
+        # input line
+        buf, pos = self.irc_in["buf"], self.irc_in["pos"]
+        bg = "sel_bg" if focused else "bar_bg"
+        label = clip("[%s] " % ("server" if key == IRC_SERVER else (snap["name"] if snap else "-")), max(6, pw // 3))
+        self.fill(input_y, ox, pw, self.attr("fg", bg))
+        lx = self.put(input_y, ox + 1, label, self.attr("accent" if focused else "dim", bg, bold=focused))
+        avail = pw - 2 - cell_len(label)
+        if not focused and not buf:
+            self.put(input_y, lx, "click here or press %s to chat" % self.first_key("irc"), self.attr("dim", bg), avail)
+        else:
+            start = 0
+            while cell_len("".join(buf[start:pos])) >= avail - 1:
+                start += 1
+            self.put(input_y, lx, "".join(buf[start:]), self.attr("fg", bg), avail)
+            if focused:
+                cxp = lx + cell_len("".join(buf[start:pos]))
+                under = buf[pos] if pos < len(buf) else " "
+                self.put(input_y, cxp, under, self.attr("fg", bg, reverse=True))
+        hits.append(("input", ox, input_y, ox + pw, input_y + 1, None))
+        hits.append(("pane", ox, oy, ox + pw, oy + ph, None))
+
+    def irc_input_key(self, name, ch, full):
+        """Edit the chat input line. Returns None, or leave, full, dock, layout for the caller to act on."""
+        st = self.irc_in
+        buf, pos = st["buf"], st["pos"]
+        hist = self.irc_hist
+        mh = max(1, self.irc_mh)
+        if name != "tab":
+            st["cand"] = None
+        if name in ("esc", "ctrl-c"):
+            return "leave"
+        if name == "ctrl-f":
+            return "leave" if full else "full"
+        if name == "ctrl-s":
+            return "dock" if full else "layout"
+        if name == "enter":
+            text = "".join(buf)
+            st["buf"], st["pos"] = [], 0
+            self.irc_scroll = 0
+            if text.strip():
+                if not text.startswith(("/ns", "/nickserv", "/identify", "/cs", "/chanserv", "/raw", "/quote")):
+                    hist[:] = [h for h in hist if h != text][-50:] + [text]
+                st["hi"] = len(hist)
+                if self.irc_submit(text, None):
+                    return "leave"
+            return None
+        if name in ("ctrl-n", "alt-down"):
+            self.irc_select(step=1)
+        elif name in ("ctrl-p", "alt-up"):
+            self.irc_select(step=-1)
+        elif name.startswith("alt-") and name[4:].isdigit():
+            self.irc_select(index=int(name[4:]) - 1)
+        elif name == "pgup":
+            self.irc_scroll += max(1, mh - 2)
+        elif name == "pgdn":
+            self.irc_scroll = max(0, self.irc_scroll - max(1, mh - 2))
+        elif name == "up":
+            if st["hi"] > 0:
+                st["hi"] -= 1
+                st["buf"] = list(hist[st["hi"]])
+                st["pos"] = len(st["buf"])
+        elif name == "down":
+            if st["hi"] < len(hist):
+                st["hi"] += 1
+                st["buf"] = list(hist[st["hi"]]) if st["hi"] < len(hist) else []
+                st["pos"] = len(st["buf"])
+        elif name == "left":
+            st["pos"] = max(0, pos - 1)
+        elif name == "right":
+            st["pos"] = min(len(buf), pos + 1)
+        elif name in ("home", "ctrl-a"):
+            st["pos"] = 0
+        elif name in ("end", "ctrl-e"):
+            st["pos"] = len(buf)
+        elif name == "backspace":
+            if pos > 0:
+                del buf[pos - 1]
+                st["pos"] = pos - 1
+        elif name == "delete":
+            if pos < len(buf):
+                del buf[pos]
+        elif name == "ctrl-u":
+            del buf[:pos]
+            st["pos"] = 0
+        elif name == "ctrl-k":
+            del buf[pos:]
+        elif name == "ctrl-w":
+            j = pos
+            while j > 0 and buf[j - 1] == " ":
+                j -= 1
+            while j > 0 and buf[j - 1] != " ":
+                j -= 1
+            del buf[j:pos]
+            st["pos"] = j
+        elif name == "tab":
+            c = self.irc.get(self.irc_sel[0])
+            if c:
+                if st["cand"] is None:
+                    j = pos
+                    while j > 0 and buf[j - 1] != " ":
+                        j -= 1
+                    word = "".join(buf[j:pos])
+                    names = [n for n, _ in c.nick_list(self.irc_sel[1])]
+                    hits = sorted([n for n in names if n.lower().startswith(word.lower().rstrip(":"))], key=str.lower) if word else []
+                    if hits:
+                        st["cand"] = {"start": j, "end": pos, "hits": hits, "i": -1}
+                cd = st["cand"]
+                if cd:
+                    cd["i"] = (cd["i"] + 1) % len(cd["hits"])
+                    rep = cd["hits"][cd["i"]] + (": " if cd["start"] == 0 else " ")
+                    buf[cd["start"]:cd["end"]] = list(rep)
+                    cd["end"] = cd["start"] + len(rep)
+                    st["pos"] = cd["end"]
+        elif ch:
+            buf.insert(pos, ch)
+            st["pos"] = pos + 1
+        return None
+
+    def irc_mouse(self, full=False, ev=None):
+        """Mouse over the chat pane or screen. True when the event was used."""
+        if ev is None:
+            try:
+                _, mx, my, _, bstate = curses.getmouse()
+            except curses.error:
+                return False
+        else:
+            mx, my, bstate = ev
+        hit = None
+        for kind, x0, y0, x1, y1, pl in self.irc_hits:
+            if x0 <= mx < x1 and y0 <= my < y1:
+                hit = (kind, pl)
+                break
+        if hit is None:
+            return False
+        kind, pl = hit
+        up = getattr(curses, "BUTTON4_PRESSED", 0)
+        down = getattr(curses, "BUTTON5_PRESSED", 0)
+        if up and bstate & up:
+            if kind == "buf":
+                self.irc_select(step=-1)
+            else:
+                self.irc_scroll += 3
+            return True
+        if down and bstate & down:
+            if kind == "buf":
+                self.irc_select(step=1)
+            else:
+                self.irc_scroll = max(0, self.irc_scroll - 3)
+            return True
+        if not bstate & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED | curses.BUTTON1_DOUBLE_CLICKED):
+            return True
+        if kind == "buf":
+            self.irc_select(to=pl)
+        elif kind == "nick":
+            c, key = self.irc_current()
+            if c and pl.lower() != c.nick.lower():
+                c.buf(pl, "query")
+                self.irc_select(to=(c.name, pl.lower()))
+                self.say("private chat with %s" % pl, "accent2", 2)
+        if not full:
+            self.focus = "chat"
+        return True
+
+    def irc_screen(self):
+        self.irc_current()
+        st = {"dirty": True, "sig": None}
 
         def render():
             scr = self.scr
@@ -8181,96 +8547,12 @@ class App:
             if H < 8 or W < 30:
                 self.put(0, 0, "terminal too small", self.attr("err"))
                 return
-            self.irc_sync_view()
-            lw, nw, cx, cw = geometry(H, W)
-            sel_c = self.irc.get(self.irc_sel[0])
-            key = self.irc_sel[1]
-            snap = sel_c.snapshot(key) if sel_c else None
-            right = ""
-            if sel_c:
-                right = "%s as %s  %s" % (sel_c.name, sel_c.nick, sel_c.status)
+            self.irc_hits = []
+            c, _ = self.irc_current()
+            right = "%s as %s  %s" % (c.name, c.nick, c.status) if c else ""
             self.screen_bar(W, "irc", right)
-            s = self.sym
-            top, bot = 2, H - 2
-            mh = bot - top
-            # buffer list
-            if lw:
-                r = 1
-                for kind, c, k in self.irc_entries():
-                    if r >= H - 2:
-                        break
-                    if kind == "net":
-                        glyph = {"online": "o" if self.opts["ascii"] else "●", "offline": "-" if self.opts["ascii"] else "○"}.get(c.status, "~" if self.opts["ascii"] else "◌")
-                        self.put(r, 1, clip("%s %s" % (glyph, c.name), lw - 1), self.attr("accent2" if c.status == "online" else "dim", bold=True))
-                    else:
-                        b = c.buffers[k]
-                        sel = (c.name, k) == self.irc_sel
-                        label = "server" if k == IRC_SERVER else b.name
-                        tail = ""
-                        if b.mentions:
-                            tail = " %d!" % b.mentions
-                        elif b.unread:
-                            tail = " %d" % b.unread
-                        a = self.attr("accent", "sel_bg", bold=True) if sel else self.attr("today" if b.mentions else ("fg" if b.unread else "dim"), bold=bool(b.unread))
-                        if sel:
-                            self.fill(r, 0, lw, a)
-                        self.put(r, 2, clip(label, lw - 3 - len(tail)), a)
-                        if tail:
-                            self.put(r, lw - len(tail) - 1, tail, a)
-                    r += 1
-                for rr in range(1, H - 2):
-                    self.put(rr, lw, s["vline"], self.attr("border"))
-            # topic row
-            title = ""
-            if snap:
-                title = ("server" if key == IRC_SERVER else snap["name"])
-                if snap["topic"]:
-                    title += "  " + irc_strip_format(snap["topic"])
-            else:
-                title = "no connection, type /connect or /help"
-            self.put(1, cx, clip(title, cw), self.attr("accent2", bold=True))
-            # messages
-            rows = []
-            if snap:
-                for entry in snap["lines"][-(mh + st["scroll"] + 60):]:
-                    rows.extend(self.irc_line_rows(entry, cw, sel_c))
-            maxscroll = max(0, len(rows) - mh)
-            st["scroll"] = max(0, min(st["scroll"], maxscroll))
-            end = len(rows) - st["scroll"]
-            window = rows[max(0, end - mh):end]
-            y0 = top + mh - len(window)
-            for i, row in enumerate(window):
-                x = cx
-                for text, role, bold in row:
-                    if x >= cx + cw:
-                        break
-                    x = self.put(top + (mh - len(window)) + i, x, text, self.attr(role, bold=bold), cx + cw - x)
-            if st["scroll"]:
-                self.put(top, cx + cw - 12, " scrolled %d " % st["scroll"], self.attr("today", "bar_bg"))
-            # nick list
-            if nw and snap:
-                nx = W - nw
-                for rr in range(1, H - 2):
-                    self.put(rr, nx - 1, s["vline"], self.attr("border"))
-                self.put(1, nx, "%d nicks" % len(snap["nicks"]), self.attr("dim"), nw)
-                for i, (n, pre) in enumerate(snap["nicks"][:H - 5]):
-                    role = "accent" if n.lower() == sel_c.nick.lower() else (self.IRC_NICK_ROLES[irc_color_index(n, len(self.IRC_NICK_ROLES))] if self.opts.get("irc_nick_colors", True) else "fg")
-                    self.put(2 + i, nx, clip((pre or " ") + n, nw - 1), self.attr(role))
-            # input
-            label = "[%s] " % ("server" if key == IRC_SERVER else (snap["name"] if snap else "-"))
-            label = clip(label, max(6, W // 3))
-            avail = W - 2 - cell_len(label)
-            start = 0
-            while cell_len("".join(buf[start:pos])) >= avail - 1:
-                start += 1
-            shown = "".join(buf[start:])
-            self.fill(H - 2, 0, W, self.attr("fg", "sel_bg"))
-            lx = self.put(H - 2, 1, label, self.attr("accent", "sel_bg", bold=True))
-            self.put(H - 2, lx, shown, self.attr("fg", "sel_bg"), avail)
-            cxp = lx + cell_len("".join(buf[start:pos]))
-            under = buf[pos] if pos < len(buf) else " "
-            self.put(H - 2, cxp, under, self.attr("fg", "sel_bg", reverse=True))
-            self.screen_foot(H, W, "enter send  tab nick  ctrl-n/p buffer  pgup/pgdn scroll  /help  esc back to tasks")
+            self.irc_draw_pane(1, 0, H - 2, W, "full")
+            self.screen_foot(H, W, "enter send  tab nick  ctrl-n/p buffer  ctrl-s dock beside tasks  esc back  /help")
             if self.msg and time.time() < self.msg_until:
                 self.fill(H - 1, 0, W, self.attr("fg", "bar_bg"))
                 self.put(H - 1, 1, self.msg, self.attr(self.msg_kind, "bar_bg", bold=True), W - 2)
@@ -8291,99 +8573,18 @@ class App:
                 if name == "tick":
                     continue
                 st["dirty"] = True
-                if name in ("resize", "mouse"):
+                if name == "resize":
                     continue
-                H, W = self.scr.getmaxyx()
-                mh = max(1, H - 4)
-                if name not in ("tab",):
-                    st["cand"] = None
-                if name in ("esc", "ctrl-c"):
+                if name == "mouse":
+                    self.irc_mouse(full=True)
+                    continue
+                r = self.irc_input_key(name, ch, True)
+                if r == "leave":
                     break
-                elif name == "enter":
-                    text = "".join(buf)
-                    buf, pos = [], 0
-                    st["scroll"] = 0
-                    if text.strip():
-                        if not text.startswith(("/ns", "/nickserv", "/identify", "/cs", "/chanserv", "/raw", "/quote")):
-                            hist[:] = [h for h in hist if h != text][-50:] + [text]
-                        hi[0] = len(hist)
-                        if self.irc_submit(text, hi):
-                            break
-                elif name in ("ctrl-n", "alt-down"):
-                    self.irc_select(step=1)
-                    st["scroll"] = 0
-                elif name in ("ctrl-p", "alt-up"):
-                    self.irc_select(step=-1)
-                    st["scroll"] = 0
-                elif name.startswith("alt-") and name[4:].isdigit():
-                    self.irc_select(index=int(name[4:]) - 1)
-                    st["scroll"] = 0
-                elif name == "pgup":
-                    st["scroll"] += max(1, mh - 2)
-                elif name == "pgdn":
-                    st["scroll"] = max(0, st["scroll"] - max(1, mh - 2))
-                elif name == "up":
-                    if hi[0] > 0:
-                        hi[0] -= 1
-                        buf = list(hist[hi[0]])
-                        pos = len(buf)
-                elif name == "down":
-                    if hi[0] < len(hist):
-                        hi[0] += 1
-                        buf = list(hist[hi[0]]) if hi[0] < len(hist) else []
-                        pos = len(buf)
-                elif name == "left":
-                    pos = max(0, pos - 1)
-                elif name == "right":
-                    pos = min(len(buf), pos + 1)
-                elif name in ("home", "ctrl-a"):
-                    pos = 0
-                elif name in ("end", "ctrl-e"):
-                    pos = len(buf)
-                elif name == "backspace":
-                    if pos > 0:
-                        del buf[pos - 1]
-                        pos -= 1
-                elif name == "delete":
-                    if pos < len(buf):
-                        del buf[pos]
-                elif name == "ctrl-u":
-                    del buf[:pos]
-                    pos = 0
-                elif name == "ctrl-k":
-                    del buf[pos:]
-                elif name == "ctrl-w":
-                    j = pos
-                    while j > 0 and buf[j - 1] == " ":
-                        j -= 1
-                    while j > 0 and buf[j - 1] != " ":
-                        j -= 1
-                    del buf[j:pos]
-                    pos = j
-                elif name == "tab":
-                    sel_c = self.irc.get(self.irc_sel[0])
-                    if sel_c:
-                        if st["cand"] is None:
-                            j = pos
-                            while j > 0 and buf[j - 1] != " ":
-                                j -= 1
-                            word = "".join(buf[j:pos])
-                            names = [n for n, _ in sel_c.nick_list(self.irc_sel[1])]
-                            hits = sorted([n for n in names if n.lower().startswith(word.lower().rstrip(":"))], key=str.lower) if word else []
-                            if hits:
-                                st["cand"] = {"start": j, "end": pos, "hits": hits, "i": -1}
-                        cd = st["cand"]
-                        if cd:
-                            cd["i"] = (cd["i"] + 1) % len(cd["hits"])
-                            rep = cd["hits"][cd["i"]] + (": " if cd["start"] == 0 else " ")
-                            buf[cd["start"]:cd["end"]] = list(rep)
-                            cd["end"] = cd["start"] + len(rep)
-                            pos = cd["end"]
-                elif ch:
-                    buf.insert(pos, ch)
-                    pos += 1
+                if r == "dock":
+                    self.irc_show_pane()
+                    break
         finally:
-            self.irc_draft = "".join(buf)
             for c in self.irc.values():
                 if c.viewing is not None:
                     c.view(None)
@@ -11443,6 +11644,8 @@ class App:
             _, mx, my, _, bstate = curses.getmouse()
         except curses.error:
             return
+        if self.irc_hits and self.irc_mouse(ev=(mx, my, bstate)):
+            return
         g = self.geo
         if not g:
             return
@@ -11461,6 +11664,11 @@ class App:
                 self.act_detail_tab(name=name)
                 return
         if g["sw"] and mx < g["sw"]:
+            for ry, cn, k in self.irc_side:
+                if ry == my:
+                    self.irc_select(to=(cn, k))
+                    self.irc_show_pane()
+                    return
             items = self.sidebar_items()
             r = my - g["list_y"]
             if 0 <= r < len(items) and not items[r]["head"]:
@@ -11494,11 +11702,21 @@ class App:
             return None
         return self.keymap.get(name)
 
-    def dispatch(self, name):
+    def dispatch(self, name, ch=None):
         if name == "mouse":
             self.handle_mouse()
             return
         if name in ("tick", "resize"):
+            return
+        if self.focus == "chat":
+            r = self.irc_input_key(name, ch, False)
+            if r == "leave":
+                self.focus = "list"
+            elif r == "full":
+                self.irc_screen()
+            elif r == "layout":
+                nxt = {"right": "bottom", "bottom": "off", "off": "right"}[self.irc_layout()]
+                self.irc_set_layout(nxt, focus=nxt != "off")
             return
         action = self.resolve_chord(name)
         if action is None:
@@ -11676,15 +11894,15 @@ class App:
             self.git_apply()
             self.ics_poll()
             self.draw()
-            name, _ = self.read_key()
-            self.dispatch(name)
+            name, ch = self.read_key()
+            self.dispatch(name, ch)
             # a held key queues many events: apply them first and draw once
             burst = 0
             while self.running and burst < 16 and self.input_pending():
-                name, _ = self.read_key()
+                name, ch = self.read_key()
                 if name == "tick":
                     break
-                self.dispatch(name)
+                self.dispatch(name, ch)
                 burst += 1
 
 
